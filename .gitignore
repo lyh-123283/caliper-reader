@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 调试输出目录
+_debug_out/
+
+# 参数测试相关
+param_search_results/
+param_*_test/
+param_*_test2/
+param_visualizations/
+
+# 结果输出
+results/
+
+# IDE
+.vscode/
+.idea/
+
+# 编辑器配置（保留）
+# .editorconfig 保留
