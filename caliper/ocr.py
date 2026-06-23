@@ -525,6 +525,7 @@ class DigitReader:
         """
         if patch is None or patch.size == 0:
             return None
+        self._ensure_engine()
         if gray_region is not None and bbox is not None:
             x1, y1, x2, y2 = bbox
             x1 = max(0, min(x1, gray_region.shape[1] - 1))

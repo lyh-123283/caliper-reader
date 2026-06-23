@@ -13,7 +13,10 @@ import numpy as np
 from typing import List, Tuple
 
 from .result import DigitInfo
-from .utils import find_peaks_adaptive, extract_ticks_from_binary, draw_projection_plot, refine_ticks_by_spacing
+from .utils import (
+    find_peaks_adaptive, extract_ticks_from_binary, draw_projection_plot,
+    refine_ticks_by_spacing,
+)
 from .ocr import DigitReader
 from .config import config
 
@@ -77,9 +80,6 @@ def recognize_main_scale(region: dict,
         return _empty_main_result()
 
     # ── 2.5 等间距补全 & 校验 ──
-    #     物理约束：主尺刻度线相邻间距严格相等。
-    #     垂直投影偶尔会漏检（对比度低/噪声）或误检（伪影），
-    #     利用等间距特性补全遗漏、过滤误检。
     if config.main_scale.spacing_refine_enabled:
         refined_xs = refine_ticks_by_spacing(
             main_xs, binary,
@@ -99,6 +99,7 @@ def recognize_main_scale(region: dict,
         return _empty_main_result()
 
     main_ticks.sort(key=lambda t: t['x'])
+    main_xs = np.array([t['x'] for t in main_ticks], dtype=int)
     main_gap = float(np.median(np.diff([t['x'] for t in main_ticks])))
 
     # v6.5: OCR 数字识别已迁移到 merger（在拿到 zero_x 后定向识别）
@@ -156,17 +157,16 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
 
     H, W = binary.shape[:2]
 
-    # 1. 找主尺最顶刻度线 y 位置（排除 DELIXI 长刻度 is_long=True）
-    main_short = [t for t in main_ticks if not t.get('is_long') and 'y_start' in t]
-    if not main_short:
+    # 1. 找主尺刻度线上沿 y 位置（取最大值，因为数字在上方，下探越深越安全）
+    y_starts = [t['y_start'] for t in main_ticks if 'y_start' in t]
+    if len(y_starts) < 3:
         return None, 0, 0
-    y_top_tick = min(t['y_start'] for t in main_short)
+    y_top_tick = max(y_starts)
 
-    # 2. 备选区 y 范围
-    y_top = max(0, y_top_tick - int(2 * main_gap))
-    y_bottom = min(H, y_top_tick)
-    if y_bottom - y_top < 8:
-        return None, 0, 0
+    # 2. 备选区 y 范围：整体上移 1*tick_gap
+    y_top = max(0, y_top_tick - int(4 * main_gap))
+    y_bottom = max(y_top + 8, y_top_tick - int(1 * main_gap))
+    y_bottom = min(H, y_bottom)
 
     # 3. 备选区 x 范围
     cm_px = int(main_gap * 10)  # 1cm 像素
@@ -182,21 +182,23 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
 
 def find_largest_digit_cc(binary_crop: np.ndarray,
                             x_offset: int, y_offset: int,
-                            min_area: int = 50,
-                            max_area: int = 600,
+                            zero_x: float = None,
+                            min_area: int = 700,
+                            max_area: int = 1200,
                             min_aspect: float = 0.6,
                             max_aspect: float = 3.5) -> tuple:
     """v6.6: 在备选区二值图中找**最像数字**的连通域。
 
     数字连通域的特征（v6.5 经验）：
-      - 面积: 50 ~ 600 px²（不能太小如噪点，不能太大如刻线）
+      - 面积: 700 ~ 1200 px²
       - 高/宽比: 0.6 ~ 3.5（数字大致 1:1 ~ 1:1.5，但 "1" 窄长）
       - 位置: 偏向备选区下半（数字底部贴刻度线）
-      - 优先选 x 大的（zero_x 附近）—— 最近的 cm 数字
+      - 优先选零线左侧且最靠右的（最近 cm 数字）
 
     Args:
         binary_crop: 备选区二值图
         x_offset, y_offset: 在原图中的偏移
+        zero_x: 零线 x 坐标（用于优先左侧候选）
         min/max_area, min/max_aspect: 连通域筛选阈值
 
     Returns:
@@ -239,11 +241,11 @@ def find_largest_digit_cc(binary_crop: np.ndarray,
     if not candidates:
         return None, None, 0.0
 
-    # 合并多笔画连通域（数字 0, 8, 6 等由多个组件组成）
-    # 简化：先按 x 分组，相邻 x 距离 < tick_gap 的合并
-    # 此处不做复杂合并，简单按 y 位置和面积筛
-    # 选 x_ratio 最大的（即最靠右——zero_x 附近）+ 面积合理的
-    candidates.sort(key=lambda c: (c['x_ratio'] * 0.6 + c['y_ratio'] * 0.2 + (c['area'] / max_area) * 0.2), reverse=True)
+    # 优先级：零线左侧 > 零线右侧；同侧选 x 更大（更靠近零线）
+    candidates.sort(key=lambda c: (
+        (c['x'] + c['w'] / 2 + x_offset) >= zero_x if zero_x is not None else False,
+        -(c['x'] + c['w'] / 2)
+    ))
     best = candidates[0]
 
     # 提取 patch（含 padding）

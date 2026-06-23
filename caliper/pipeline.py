@@ -45,7 +45,7 @@ class CaliperPipeline:
         """设置手动精度覆盖。None 表示自动推断。"""
         self._override_precision = precision
 
-    def run(self, img: np.ndarray) -> CaliperResult:
+    def run(self, img: np.ndarray, progress_callback=None) -> CaliperResult:
         """
         执行完整流水线
 
@@ -335,7 +335,7 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
 
     # ── 2. 连通域筛选 ──
     digit_crop, sel_bbox, cc_conf = find_largest_digit_cc(
-        binary_crop, x_off, y_off)
+        binary_crop, x_off, y_off, zero_x)
 
     # ── 3. OCR ──
     reader = get_ocr_reader_singleton()
@@ -366,6 +366,14 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     cv2.rectangle(panel_a, (x_off, y_off), (x_off + cw, y_off + ch), (0, 0, 255), 2)
     cv2.putText(panel_a, f"backup ({cw}x{ch})", (x_off + 3, y_off + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+
+    # y_top_tick 线（青蓝色虚线），即 max(y_start)
+    y_top_tick = max(t.get('y_start', 0) for t in main_ticks) if main_ticks else 0
+    for x in range(0, W_main, 10):
+        x2 = min(W_main, x + 5)
+        cv2.line(panel_a, (x, y_top_tick), (x2, y_top_tick), (255, 200, 50), 1)
+    cv2.putText(panel_a, f"y_top_tick={y_top_tick} (max y_start)", (4, y_top_tick - 6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 50), 1)
 
     # ═══════════════════════════════════
     #  Panel B: 备选区 blow up 4x

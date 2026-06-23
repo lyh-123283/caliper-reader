@@ -98,6 +98,7 @@ def merge_readings(main_result: dict,
             'main_gap_px': main_gap,
             'zero_x': zero_x,
             'main_digits': [(d.text, d.value, d.x) for d in main_digits],
+            'main_derivation': main_derivation,
             'derivation_vis': derivation_vis,
         },
     )
@@ -179,7 +180,7 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
 
         # 2. 在备选区找最像数字的连通域
         digit_crop, bbox, confidence = find_largest_digit_cc(
-            binary_crop, x_off, y_off)
+            binary_crop, x_off, y_off, zero_x)
         if digit_crop is None or confidence < 0.3:
             return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
 
@@ -189,8 +190,18 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
         if digit is None or digit.value < 0:
             return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
 
-        # 4. 算 extra_ticks = digit.x 到 zero_x 之间的 main_ticks 数（mm 数）
-        extra_ticks = sum(1 for x in main_xs if digit.x < x <= zero_x)
+        # 4. 算 extra_ticks = digit bbox 下沿到 zero_x 之间的主尺刻度线数（mm）
+        #    digit.x 是 patch 中心，用最接近的 main_tick 作为 ref
+        ref_x = None
+        best_dist = float('inf')
+        for t in main_ticks:
+            d = abs(t['x'] - digit.x)
+            if d < best_dist:
+                best_dist = d
+                ref_x = float(t['x'])
+        if ref_x is None:
+            ref_x = digit.x
+        extra_ticks = sum(1 for x in main_xs if ref_x + main_gap * 0.3 < x <= zero_x)
         # 5. 读数 = digit.value × 10（cm → mm）+ extra_ticks
         reading = float(digit.value) * 10 + extra_ticks
         return reading, {
@@ -198,7 +209,7 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
             'extra_ticks': extra_ticks,
             'strategy': 'ocr',
             'first_tick_x': None,
-            'ref_tick_x': digit.x,
+            'ref_tick_x': ref_x,
         }
 
     # ── 策略 2/3：纯几何回退（OCR 路径无结果时） ──

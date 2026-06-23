@@ -41,7 +41,7 @@ def extract_roi(img_color: np.ndarray,
     img_binary_for_proj = cv2.bitwise_not(img_binary) if img_binary is not None else None
 
     # ── 生成 Sobel 垂直边缘二值图（备用源，天然过滤水平干扰）──
-    binary_vedge = _binary_vertical_edges(enhanced)
+    binary_vedge, sobel_grad_u8 = _binary_vertical_edges(enhanced)
 
     # ── 诊断记录 ──
     diag: dict = {
@@ -50,15 +50,23 @@ def extract_roi(img_color: np.ndarray,
         'binary_vedge': binary_vedge,
         'contour_vis': None,
         'contour_scores': [],
+        'sobel_gradient': sobel_grad_u8,      # Sobel X 梯度归一化 uint8（用于热力图可视化）
+        'enhanced': enhanced,                  # 增强灰度图引用（供 Sobel 可视化参考）
+        'com_y_diag': None,                    # COM Y 质心法可视化数据
+        'com_x_diag': None,                    # X 方向最长等间距序列可视化数据
     }
 
     if img_binary is None:
         y1, y2 = _proj_find_y_range(binary_vedge, h)
-        x1, x2 = _proj_find_x_range(binary_vedge, y1, y2, w)
+        diag['com_y_diag'] = _collect_com_y_diag(binary_vedge, h, y1, y2)
+        x1, x2, x_diag = _proj_find_x_range(binary_vedge, y1, y2, w)
+        diag['com_x_diag'] = x_diag
         diag['source'] = 'sobel'
     else:
         y1, y2 = _proj_find_y_range(img_binary_for_proj, h)
-        x1, x2 = _proj_find_x_range(img_binary_for_proj, y1, y2, w)
+        diag['com_y_diag'] = _collect_com_y_diag(img_binary_for_proj, h, y1, y2)
+        x1, x2, x_diag = _proj_find_x_range(img_binary_for_proj, y1, y2, w)
+        diag['com_x_diag'] = x_diag
 
     # ── 应急兜底：COM 法始终产生有效范围，仅极端情况下触发轮廓法 ──
     if y2 - y1 < config.roi.min_roi_height or x2 - x1 < config.roi.min_roi_width:
@@ -104,26 +112,30 @@ def extract_roi(img_color: np.ndarray,
 #  Sobel X 垂直边缘二值化（过滤水平边框/文字干扰）
 # ═══════════════════════════════════════════════════════════
 
-def _binary_vertical_edges(gray: np.ndarray) -> np.ndarray:
+def _binary_vertical_edges(gray: np.ndarray):
     """
     Sobel X 水平方向梯度 → 只保留垂直边缘 → 归一化 → OTSU 二值化。
 
     物理依据：刻度线是垂直的，Sobel X 只对竖直方向亮度变化敏感，
     天然过滤卡尺水平边框、背景水平线条、文字笔画中的水平段。
+
+    Returns:
+        (binary, grad_u8) — OTSU 二值图 和 梯度归一化 uint8 图（用于可视化热力图）
     """
     # 1. 水平方向 Sobel（检测垂直边缘）
     sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
     abs_grad = np.abs(sobel_x)
 
-    # 2. 归一化到 0~255
+    # 2. 归一化到 0~255（保存一份归一化图用于可视化）
     g_max = float(np.max(abs_grad))
+    grad_u8 = np.zeros_like(gray, dtype=np.uint8)
     if g_max > 0:
-        abs_grad = (abs_grad / g_max * 255).astype(np.uint8)
+        grad_u8 = (abs_grad / g_max * 255).astype(np.uint8)
 
-    # 3. OTSU 二值化（保留强垂直边缘）
-    _, binary = cv2.threshold(abs_grad, 0, 255,
+    # 3. OTSU 二值化（保留强垂直边缘）— 用 grad_u8 做阈值
+    _, binary = cv2.threshold(grad_u8, 0, 255,
                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return binary
+    return binary, grad_u8
 
 
 # ═══════════════════════════════════════════════════════════
@@ -278,7 +290,30 @@ def _proj_find_y_range(binary: np.ndarray, h: int) -> Tuple[int, int]:
     return y1, y2
 
 
-def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[int, int]:
+def _collect_com_y_diag(binary: np.ndarray, h: int, y1: int, y2: int) -> dict:
+    """收集 COM Y 质心法可视化所需数据（避免重复计算）"""
+    if binary is None:
+        return None
+    hproj = np.sum(binary, axis=1).astype(float)
+    total = hproj.sum()
+    if total <= 0:
+        return None
+    ys = np.arange(h)
+    com_y = float(np.dot(ys, hproj) / total)
+    half_h = int(h * config.roi.y_center_span_ratio / 2)
+    span_lo = int(com_y) - half_h
+    span_hi = int(com_y) + half_h
+    return {
+        'hproj': hproj,
+        'com_y': com_y,
+        'span_lo': max(0, span_lo),
+        'span_hi': min(h - 1, span_hi),
+        'y1': y1,
+        'y2': y2,
+    }
+
+
+def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int):
     """
     x 方向 ROI 边界：用"最长等间距强峰序列"识别刻度区。
 
@@ -292,17 +327,17 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[in
     螺丝孔等的根本区别——后者要么间距不规整，要么强度比刻线弱很多。
     """
     if binary is None or y2 <= y1:
-        return 0, w - 1
+        return 0, w - 1, None
 
     strip = binary[y1:y2 + 1, :]
     vproj = np.sum(strip, axis=0).astype(float)
     total = vproj.sum()
     if total <= 0:
-        return 0, w - 1
+        return 0, w - 1, None
 
     vmax = float(np.max(vproj))
     if vmax <= 0:
-        return 0, w - 1
+        return 0, w - 1, None
     vproj_norm = vproj / vmax
 
     # 用于回退方案
@@ -313,11 +348,11 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[in
     from .utils import find_peaks_adaptive
     peaks_all = find_peaks_adaptive(vproj_norm, min_dist=3, threshold_factor=0.3)
     if len(peaks_all) < 10:
-        return _fallback_com_x_range(com_x, w)
+        fx1, fx2 = _fallback_com_x_range(com_x, w)
+        return fx1, fx2, None
 
     # ── 2. 强度过滤：保留中等及以上强度的峰 ──
     strength = vproj_norm[peaks_all]
-    # v5.3: 用 30 分位作为门槛（保留 ≥ 30 分位强度的峰）—— 中位太严会切碎刻度段
     th_strength = max(0.15, float(np.percentile(strength, 30)))
     strong_mask = strength >= th_strength
     strong_peaks = peaks_all[strong_mask]
@@ -327,42 +362,53 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[in
     # ── 3. 估算 tick_gap：用相邻 gap 的中位数 ──
     diffs = np.diff(strong_peaks)
     if len(diffs) == 0:
-        return _fallback_com_x_range(com_x, w)
+        fx1, fx2 = _fallback_com_x_range(com_x, w)
+        return fx1, fx2, None
     tick_gap = float(np.median(diffs))
     if tick_gap < 3.0:
-        return _fallback_com_x_range(com_x, w)
+        fx1, fx2 = _fallback_com_x_range(com_x, w)
+        return fx1, fx2, None
 
     # ── 4. 寻找"最长等间距强峰序列" ──
-    #     游标卡尺主尺/游标尺刻度都严格等间距；中间出现 1~2 个"不规整 gap"
-    #     可能是 OCR 数字遮挡或局部模糊，不应直接切段。
-    #     策略：允许 max_irregular 个连续 irregular gap 才切段。
     lo_gap = tick_gap * 0.50
-    hi_gap = tick_gap * 1.80   # v5.3: 放宽到 1.80（之前 1.60 太严）
-    max_irregular = 2          # 容忍连续 2 个 irregular gap
+    hi_gap = tick_gap * 1.80
+    max_irregular = 2
 
-    segments = []  # 列表 of (起点 idx, 终点 idx) in strong_peaks
+    segments = []
     cur_start = 0
     irregular_run = 0
     for i, d in enumerate(diffs):
         if lo_gap <= d <= hi_gap:
-            irregular_run = 0  # 规整 gap → 重置计数
+            irregular_run = 0
         else:
             irregular_run += 1
             if irregular_run > max_irregular:
-                # 连续 irregular 太多 → 段结束（结束位置在 irregular 之前）
                 end_idx = i - irregular_run
                 if end_idx - cur_start >= 3:
                     segments.append((cur_start, end_idx))
                 cur_start = i + 1
                 irregular_run = 0
-    # 收尾
     if len(strong_peaks) - 1 - cur_start >= 3:
         segments.append((cur_start, len(strong_peaks) - 1))
 
-    if not segments:
-        return _fallback_com_x_range(com_x, w)
+    # ── 构建可视化数据（即使在回退前就收集好）──
+    x_diag = {
+        'vproj_norm': vproj_norm,
+        'peaks_all': peaks_all,
+        'strong_peaks': strong_peaks,
+        'tick_gap': tick_gap,
+        'th_strength': th_strength,
+        'segments': [list(s) for s in segments],
+        'all_segments': [list(s) for s in segments],
+        'seg_lo': None,
+        'seg_hi': None,
+    }
 
-    # ── 4b. 合并相邻段：如果两段距离 < merge_dist 像素且 tick_gap 接近 ──
+    if not segments:
+        fx1, fx2 = _fallback_com_x_range(com_x, w)
+        return fx1, fx2, x_diag
+
+    # ── 4b. 合并相邻段 ──
     merge_dist = tick_gap * 8.0
     merged = [list(segments[0])]
     for seg in segments[1:]:
@@ -373,10 +419,12 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[in
         else:
             merged.append(list(seg))
 
-    # 取最长段
     best_seg = max(merged, key=lambda s: s[1] - s[0])
     seg_lo = int(strong_peaks[best_seg[0]])
     seg_hi = int(strong_peaks[best_seg[1]])
+    x_diag['seg_lo'] = seg_lo
+    x_diag['seg_hi'] = seg_hi
+    x_diag['best_seg'] = [best_seg[0], best_seg[1]]
 
     # ── 5. 加 pad 返回 ──
     pad_x = max(int(tick_gap * 1.5),
@@ -385,19 +433,17 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int) -> Tuple[in
     x2 = min(w - 1, seg_hi + pad_x)
 
     # ── 6. v5.4: 以"游标尺压块"为中心收窄 ROI ──
-    #     用户反馈：主尺无需全部，只要游标尺附近的部分。
-    #     游标尺压块（移动金属块）在原始灰度下显著比金属面板暗，是 ROI 内
-    #     最显著的水平"低灰度带"，与卡尺其他部分（亮金属）易区分。
     vernier_x_center = _locate_vernier_block_x_by_gray(binary, x1, x2, y1, y2)
     if vernier_x_center is not None:
-        # 半宽 = max(20 个刻度, 当前 ROI 宽度的 35%)
         half_w = max(int(tick_gap * 20), int((x2 - x1) * 0.35))
         nx1 = max(x1, int(vernier_x_center) - half_w)
         nx2 = min(x2, int(vernier_x_center) + half_w)
-        if nx2 - nx1 >= tick_gap * 8:  # 至少保留 8 个刻度宽度
+        if nx2 - nx1 >= tick_gap * 8:
             x1, x2 = nx1, nx2
+    x_diag['x1'] = x1
+    x_diag['x2'] = x2
 
-    return x1, x2
+    return x1, x2, x_diag
 
 
 def _refine_roi_by_vernier_block(enhanced: np.ndarray,
@@ -661,7 +707,7 @@ def _locate_vernier_block_x_by_gray(binary: np.ndarray,
     return center
 
 
-def _fallback_com_x_range(com_x: float, w: int) -> Tuple[int, int]:
+def _fallback_com_x_range(com_x: float, w: int):
     """信号过弱时回退到原 COM 固定比例宽度算法"""
     half_w = int(w * config.roi.x_center_span_ratio / 2)
     x1 = int(com_x) - half_w
@@ -675,7 +721,7 @@ def _fallback_com_x_range(com_x: float, w: int) -> Tuple[int, int]:
     pad_x = max(3, int((x2 - x1) * config.roi.x_pad_ratio))
     x1 = max(0, x1 - pad_x)
     x2 = min(w - 1, x2 + pad_x)
-    return x1, x2
+    return x1, x2, None
 
 
 def _full_roi_result(img_color, enhanced):
@@ -757,13 +803,14 @@ def orient_caliper(roi_color: np.ndarray,
     trimmed = deviations[trim:n - trim] if n > trim * 2 else deviations
     angle = float(np.median(trimmed))
 
-    # 小角度不旋转（本来已经很正的图不需要矫正）
+    # 小角度不旋转：< 0.3° 时偏差 < ~5px（1.5° = 26px 投影洒散太大）
+    # HoughLinesP 统计有 ±0.1° 随机噪声，0.3° 以下转了反而抖动
     if abs(angle) < config.orient.rotate_min_angle or abs(angle) > config.orient.rotate_max_angle:
         angle = 0.0
 
-    rotated_color = rotate_image(roi_color, -angle)
-    rotated_gray = rotate_image(enhanced, -angle)
-    rotated_binary = rotate_image(roi_binary, -angle) if roi_binary is not None else None
+    rotated_color = rotate_image(roi_color, angle)
+    rotated_gray = rotate_image(enhanced, angle)
+    rotated_binary = rotate_image(roi_binary, angle) if roi_binary is not None else None
 
     orient_vis = _make_orient_vis(roi_color, rotated_color, angle)
 
@@ -779,6 +826,251 @@ def orient_caliper(roi_color: np.ndarray,
 # ═══════════════════════════════════════════════════════════
 #  可视化 — v3 完整三列布局
 # ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+#  可视化 — v7: Sobel X + COM Y + 最长等间距序列
+# ═══════════════════════════════════════════════════════════
+
+
+def _make_sobel_vis(enhanced: np.ndarray,
+                    grad_u8: np.ndarray,
+                    binary: np.ndarray,
+                    panel_w: int = 420) -> np.ndarray:
+    """Sobel X 垂直边缘检测可视化：原图 → 梯度热力图 → OTSU 二值图"""
+    h, w = enhanced.shape[:2]
+    pw = panel_w
+    gap = 2
+    thumb_w = (pw - gap * 2) // 3
+    thumb_h = int(h * thumb_w / max(w, 1))
+
+    def _thumb(img):
+        if len(img.shape) == 2:
+            t = cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+            return cv2.cvtColor(t, cv2.COLOR_GRAY2BGR)
+        return cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+
+    # Panel 1: 原始增强灰度图
+    p1 = _thumb(enhanced)
+    cv2.putText(p1, "Original Gray", (2, 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+
+    # Panel 2: Sobel X 梯度热力图
+    grad_color = cv2.applyColorMap(grad_u8, cv2.COLORMAP_JET)
+    p2 = cv2.resize(grad_color, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+    cv2.putText(p2, "Sobel X |grad|", (2, 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (255, 255, 255), 1)
+
+    # Panel 3: OTSU 二值图
+    p3 = _thumb(binary)
+    cv2.putText(p3, "OTSU Binary", (2, 12),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (200, 200, 200), 1)
+
+    row = np.zeros((thumb_h, pw, 3), dtype=np.uint8)
+    row[:] = (30, 30, 35)
+    row[:, :thumb_w] = p1
+    row[:, thumb_w + gap:2 * thumb_w + gap] = p2
+    col3_start = 2 * thumb_w + 2 * gap
+    row[:, col3_start:col3_start + thumb_w] = p3
+
+    # 底部标签
+    label_h = 16
+    vis = np.zeros((thumb_h + label_h, pw, 3), dtype=np.uint8)
+    vis[:] = (30, 30, 35)
+    vis[:thumb_h, :] = row
+    cv2.putText(vis, "Sobel X — 垂直边缘检测 | 刻度线垂直 → 对竖直亮度变化敏感",
+                (4, thumb_h + label_h - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 170), 1)
+    return vis
+
+
+def _make_com_y_vis(com_diag: dict, total_w: int, full_h: int) -> np.ndarray:
+    """Y 方向 COM 质心法可视化：每行白像素总数投影图 + COM 质心 + ROI 边界标注"""
+    if com_diag is None:
+        empty = np.zeros((140, total_w, 3), dtype=np.uint8)
+        empty[:] = (30, 30, 35)
+        cv2.putText(empty, "COM Y: no data", (10, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+        return empty
+
+    hproj = com_diag['hproj']
+    com_y = com_diag['com_y']
+    span_lo = com_diag['span_lo']
+    span_hi = com_diag['span_hi']
+    y1 = com_diag['y1']
+    y2 = com_diag['y2']
+
+    plot_h = 160
+    label_h = 20
+    margin_left = 50
+    plot_w = total_w - margin_left - 16
+    vis = np.zeros((plot_h + label_h, total_w, 3), dtype=np.uint8)
+    vis[:] = (30, 30, 35)
+
+    h_max = float(np.max(hproj))
+    h_norm = hproj / h_max if h_max > 0 else hproj
+
+    # 缩放：x=像素值, y=行号
+    scale_y = (plot_h - 20) / full_h
+    scale_v = (plot_w - 10) / max(h_max, 1)
+
+    plot = np.zeros((plot_h, plot_w, 3), dtype=np.uint8)
+    plot[:] = (22, 22, 28)
+    # 网格线
+    for gy in range(0, plot_h, 30):
+        cv2.line(plot, (0, gy), (plot_w, gy), (35, 35, 40), 1)
+    for gx in range(0, plot_w, 40):
+        cv2.line(plot, (gx, 0), (gx, plot_h), (35, 35, 40), 1)
+
+    # 曲线：y 轴 = 行号，x 轴 = 白像素总数
+    pts = []
+    for yi, val in enumerate(hproj):
+        px = int(val * scale_v / max(h_max, 1) * (plot_w - 15) + 8)
+        py = int(yi * scale_y) + 10
+        pts.append((px, py))
+
+    # 填充 + 曲线
+    for i in range(len(pts)):
+        cv2.line(plot, (8, pts[i][1]), (pts[i][0], pts[i][1]),
+                 (60, 100, 160, 60), 1, cv2.LINE_AA)
+    for i in range(len(pts) - 1):
+        cv2.line(plot, pts[i], pts[i + 1], (100, 180, 255), 1)
+
+    # COM 质心线（红色虚线）
+    com_py = int(com_y * scale_y) + 10
+    cv2.line(plot, (0, com_py), (plot_w, com_py), (80, 60, 200), 1, cv2.LINE_AA)
+
+    # span 范围半透明带
+    sp_lo = int(span_lo * scale_y) + 10
+    sp_hi = int(span_hi * scale_y) + 10
+    overlay = np.zeros_like(plot)
+    cv2.rectangle(overlay, (0, sp_lo), (plot_w, sp_hi), (40, 80, 40), -1)
+    plot = cv2.addWeighted(plot, 0.85, overlay, 0.15, 0)
+
+    # 最终 ROI 边界（黄色虚线）
+    ry1 = int(y1 * scale_y) + 10
+    ry2 = int(y2 * scale_y) + 10
+    cv2.line(plot, (0, ry1), (plot_w, ry1), (50, 200, 220), 1, cv2.LINE_AA)
+    cv2.line(plot, (0, ry2), (plot_w, ry2), (50, 200, 220), 1, cv2.LINE_AA)
+
+    # 放置 plot 到 vis（右移 margin_left 给 y 轴标签留空间）
+    vis[:plot_h, margin_left:margin_left + plot_w] = plot
+
+    # y 轴标签
+    cv2.putText(vis, "Y", (2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+    cv2.putText(vis, "0", (margin_left - 20, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.25, (140, 140, 140), 1)
+    cv2.putText(vis, f"{full_h}", (margin_left - 28, plot_h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.25, (140, 140, 140), 1)
+
+    # 底部文字
+    cv2.putText(vis,
+                f"Y COM Centroid — 质心: y={com_y:.1f}  |  span: [{span_lo},{span_hi}]  |  ROI: [{y1},{y2}]",
+                (4, plot_h + label_h - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 170), 1)
+
+    return vis
+
+
+def _make_longest_seq_x_vis(x_diag: dict, total_w: int) -> np.ndarray:
+    """X 方向最长等间距序列法可视化：垂直投影 + 全峰 + 强峰 + 选中段"""
+    if x_diag is None:
+        empty = np.zeros((260, total_w, 3), dtype=np.uint8)
+        empty[:] = (30, 30, 35)
+        cv2.putText(empty, "Longest Equidistant Sequence: no data", (10, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (120, 120, 120), 1)
+        return empty
+
+    vproj = x_diag.get('vproj_norm')
+    peaks_all = x_diag.get('peaks_all')
+    strong_peaks = x_diag.get('strong_peaks')
+    tick_gap = x_diag.get('tick_gap', 0)
+    th_strength = x_diag.get('th_strength', 0)
+    seg_lo = x_diag.get('seg_lo')
+    seg_hi = x_diag.get('seg_hi')
+
+    plot_h = 200
+    info_h = 50
+    total_h = plot_h + info_h
+    n = len(vproj) if vproj is not None else 0
+    if n == 0:
+        empty = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+        empty[:] = (30, 30, 35)
+        return empty
+
+    vis = np.zeros((total_h, total_w, 3), dtype=np.uint8)
+    vis[:] = (30, 30, 35)
+
+    plot_w = total_w - 16
+    ox, oy = 8, 8
+
+    plot = np.zeros((plot_h, plot_w, 3), dtype=np.uint8)
+    plot[:] = (22, 22, 28)
+    # 网格
+    for gy in range(0, plot_h, 25):
+        cv2.line(plot, (0, gy), (plot_w, gy), (32, 32, 36), 1)
+
+    scale_x = (plot_w - 10) / max(n, 1)
+
+    def px(x):
+        return int(x * scale_x) + 5
+
+    def py(v):
+        return plot_h - 8 - int(v * (plot_h - 20))
+
+    # 投影曲线
+    for i in range(min(n - 1, plot_w - 2)):
+        x0, x1 = px(i), px(i + 1)
+        y0, y1 = py(vproj[i]), py(vproj[i + 1])
+        cv2.line(plot, (x0, y0), (x1, y1), (120, 120, 140), 1)
+
+    # 全峰（蓝色小点）
+    for pi in peaks_all:
+        if 0 <= pi < n:
+            cv2.circle(plot, (px(pi), py(vproj[pi])), 3, (180, 120, 60), -1)
+
+    # 强度阈值线
+    th_py = py(th_strength)
+    cv2.line(plot, (0, th_py), (plot_w, th_py), (120, 120, 200), 1, cv2.LINE_AA)
+    cv2.putText(plot, f"th={th_strength:.2f}", (2, th_py - 3),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.25, (120, 120, 200), 1)
+
+    # 强峰（橙色大点）
+    for pi in strong_peaks:
+        if 0 <= pi < n:
+            cv2.circle(plot, (px(pi), py(vproj[pi])), 5, (80, 180, 255), -1)
+
+    # 选中最长段（绿色半透明条）
+    if seg_lo is not None and seg_hi is not None:
+        sx1 = px(seg_lo)
+        sx2 = px(seg_hi)
+        overlay = np.zeros_like(plot)
+        cv2.rectangle(overlay, (sx1, 0), (sx2, plot_h), (0, 80, 0), -1)
+        plot = cv2.addWeighted(plot, 0.88, overlay, 0.12, 0)
+        # 边界
+        cv2.line(plot, (sx1, 0), (sx1, plot_h), (50, 200, 220), 1, cv2.LINE_AA)
+        cv2.line(plot, (sx2, 0), (sx2, plot_h), (50, 200, 220), 1, cv2.LINE_AA)
+        cv2.putText(plot, f"sel [{seg_lo},{seg_hi}]", (sx1 + 2, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.28, (50, 220, 100), 1)
+
+    vis[:plot_h, ox:ox + plot_w] = plot
+
+    # 信息栏
+    seq_len = len(strong_peaks)
+    seg_span = (seg_hi - seg_lo) if (seg_lo is not None and seg_hi is not None) else 0
+    info_text = (f"tick_gap={tick_gap:.1f}px  |  "
+                 f"强峰: {seq_len}  |  "
+                 f"选中段跨度: {seg_span}px  |  "
+                 f"阈值: {th_strength:.2f}")
+    if x_diag.get('x1') is not None:
+        info_text += f"  |  ROI x: [{x_diag['x1']},{x_diag['x2']}]"
+
+    cv2.putText(vis, info_text, (4, plot_h + 22),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+    cv2.putText(vis, "X 方向 — 最长等间距强峰序列法 | 蓝=全峰 橙=强峰 绿带=选中最长段",
+                (4, plot_h + info_h - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, (140, 140, 145), 1)
+
+    return vis
+
 
 def _make_roi_vis_v3(original: np.ndarray,
                       roi_cropped: np.ndarray,
@@ -870,7 +1162,26 @@ def _make_roi_vis_v3(original: np.ndarray,
         sc = RIGHT_W / max(cw_s, 1)
         seg_contour = cv2.resize(contour_vis, (RIGHT_W, max(int(ch_s * sc), 36)), interpolation=cv2.INTER_AREA)
 
+    # ── v7 新面板：Sobel X 梯度可视化 ──
+    sobel_grad = diag.get('sobel_gradient')
+    enh_ref = diag.get('enhanced')
+    seg_sobel_vis = None
+    if sobel_grad is not None and enh_ref is not None and binary_vedge is not None:
+        seg_sobel_vis = _make_sobel_vis(enh_ref, sobel_grad, binary_vedge, RIGHT_W)
+
+    # ── v7 新面板：COM Y 质心法可视化 ──
+    com_y_diag = diag.get('com_y_diag')
+    seg_com_y = _make_com_y_vis(com_y_diag, RIGHT_W, h)
+
+    # ── v7 新面板：X 方向最长等间距序列可视化 ──
+    com_x_diag = diag.get('com_x_diag')
+    seg_com_x = _make_longest_seq_x_vis(com_x_diag, RIGHT_W)
+
     process_panels = [status_bar, seg_adapt, seg_sobel]
+    if seg_sobel_vis is not None:
+        process_panels.append(seg_sobel_vis)
+    process_panels.append(seg_com_y)
+    process_panels.append(seg_com_x)
     if seg_contour is not None:
         process_panels.append(seg_contour)
     process_h = sum(p.shape[0] for p in process_panels) + gap * (len(process_panels) - 1)

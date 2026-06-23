@@ -42,7 +42,8 @@ def preprocess(img: np.ndarray,
             'gray':              原始灰度图
             'enhanced':          增强后的灰度图 (gamma → bilateral → median → CLAHE → unsharp)
             'binary_adaptive':   自适应阈值二值图 (THRESH_BINARY: 黑=刻度前景, 白=背景)
-            'debug_vis':         可视化对比图（3合1，标注每幅图的处理链）
+            'debug_vis':         可视化对比图（全步骤网格）
+            'intermediates':     dict 中间步骤图像，供外部可视化使用
     """
     # ── 参数默认值来自 config ──
     if clip_limit is None:
@@ -56,10 +57,12 @@ def preprocess(img: np.ndarray,
     if median_ksize is None:
         median_ksize = config.preprocess.median_ksize
     result = {'color': img.copy()}
+    intermediates = {}  # 收集中间步骤图像，供可视化使用
 
     # ── 1. 灰度化 ──
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     result['gray'] = gray
+    intermediates['01_gray'] = gray
 
     # ── 2. 幂律变换（gamma 校正）──
     #     物理意义：s = c * r^(1/gamma)
@@ -71,37 +74,42 @@ def preprocess(img: np.ndarray,
             [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
         ).astype(np.uint8)
         gray = cv2.LUT(gray, table)
+    intermediates['02_gamma'] = gray.copy()
 
     # ── 2b. 高斯模糊前置（轻量去纹理噪声，双边之前）──
     gk = config.preprocess.gauss_pre_ksize
     if gk >= 3:
         gk = gk if gk % 2 == 1 else gk + 1
         gray = cv2.GaussianBlur(gray, (gk, gk), config.preprocess.gauss_pre_sigma)
+    intermediates['03_gauss'] = gray.copy()
 
     # ── 3. 双边滤波（保边去噪）──
     denoised = cv2.bilateralFilter(gray, bilateral_d, bilateral_sigma, bilateral_sigma)
+    intermediates['04_bilateral'] = denoised.copy()
 
     # ── 4. 中值滤波（去除脉冲/椒盐噪声，与双边互补）──
     if median_ksize >= 3:
         # 确保核尺寸为奇数
         ksize = median_ksize if median_ksize % 2 == 1 else median_ksize + 1
         denoised = cv2.medianBlur(denoised, ksize)
+    intermediates['05_median'] = denoised.copy()
 
     # ── 5. CLAHE 对比度增强（局部自适应直方图均衡）──
     clahe = cv2.createCLAHE(
         clipLimit=clip_limit,
         tileGridSize=(config.preprocess.clahe_tile_w, config.preprocess.clahe_tile_h))
     enhanced = clahe.apply(denoised)
+    intermediates['06_clahe'] = enhanced.copy()
 
     # ── 6. 非锐化掩膜锐化（unsharp mask）──
     #     标准公式：sharp = orig + amount × (orig - blur)
     #     amount=0 → 不变；amount=1 → 标准锐化；amount=1.5 → 强锐化
-    #     旧代码错用 addWeighted(orig, a, blur, 1-a)，amount<1 时反而模糊
     if config.preprocess.unsharp_amount > 0.01:
         blur = cv2.GaussianBlur(enhanced, (0, 0), config.preprocess.unsharp_blur_sigma)
         # cv2.addWeighted(orig, 1+a, blur, -a, 0) 实现 orig + a*(orig - blur)
         a = config.preprocess.unsharp_amount
         enhanced = cv2.addWeighted(enhanced, 1.0 + a, blur, -a, 0)
+    intermediates['07_unsharp'] = enhanced.copy()
     result['enhanced'] = enhanced
 
     # ── 7. 自适应阈值二值化 ──
@@ -114,7 +122,7 @@ def preprocess(img: np.ndarray,
         blockSize=config.preprocess.adaptive_block_size,
         C=config.preprocess.adaptive_C
     )
-    result['binary_adaptive'] = binary_adaptive
+    intermediates['08_adaptive_bin'] = binary_adaptive.copy()
 
     # ── 9. 后处理：形态学开运算（二值化后清除孤立噪点）──
     if config.preprocess.morph_open_enabled:
@@ -126,6 +134,7 @@ def preprocess(img: np.ndarray,
             binary_adaptive, cv2.MORPH_OPEN, kernel,
             iterations=config.preprocess.morph_open_iterations,
         )
+    intermediates['09_morph_open'] = binary_adaptive.copy()
 
     # ── 10. 后处理：双向连通域过滤（剔除小面积噪声斑块）──
     if config.preprocess.cc_filter_enabled:
@@ -156,77 +165,122 @@ def preprocess(img: np.ndarray,
             binary_adaptive = cv2.add(binary_adaptive, black_mask)
 
     # ── 后处理结束后，同步更新 result ──
+    intermediates['10_cc_filter'] = binary_adaptive.copy()
     result['binary_adaptive'] = binary_adaptive
 
-    # ── 生成可视化（3合1：原图 / 增强 / 自适应阈值）──
-    result['debug_vis'] = _make_preprocess_vis(img, enhanced, binary_adaptive, gamma, median_ksize)
+    # ── 生成可视化（全步骤网格）──
+    result['intermediates'] = intermediates
+    result['debug_vis'] = _make_preprocess_vis(img, intermediates, gamma, median_ksize)
 
     return result
 
 
 def _make_preprocess_vis(original: np.ndarray,
-                          enhanced: np.ndarray,
-                          bin_adaptive: np.ndarray,
+                          intermediates: dict,
                           gamma: float = 1.0,
                           median_ksize: int = 3) -> np.ndarray:
-    """生成预处理 3 合 1 可视化，每幅图下方标注所经历的处理步骤"""
+    """生成预处理全步骤网格可视化（v7），展示从灰度到最终二值化的每条中间步骤。"""
     h, w = original.shape[:2]
 
-    scale = min(500 / max(h, w), 1.0)
-    nw, nh = int(w * scale), int(h * scale)
+    # ── 面板缩放：每格 280px 宽 ──
+    cell_w = 280
+    scale = cell_w / w
+    cell_h = max(int(h * scale), 22)
 
-    def _resize(img):
-        return cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+    def _resize_gray(img):
+        """安全缩放灰度图并转 BGR"""
+        if img is None:
+            return np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
+        if len(img.shape) == 3 and img.shape[2] == 3:
+            r = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+            return r
+        r = cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
 
-    # 三张图横向排列
-    orig_r = _resize(original)
-    enh_r = cv2.cvtColor(_resize(enhanced), cv2.COLOR_GRAY2BGR)
-    ba_r = cv2.cvtColor(_resize(bin_adaptive), cv2.COLOR_GRAY2BGR)
+    def _label_step(name, color=(220, 220, 220)):
+        """生成步骤标签小条"""
+        bar = np.zeros((18, cell_w, 3), dtype=np.uint8)
+        bar[:] = (30, 30, 35)
+        cv2.putText(bar, name, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.40, color, 1)
+        return bar
 
-    # ── 构建各面板的处理标签 ──
-    # 第 1 幅：原图（未处理）
-    label1 = "1. Original (BGR)"
+    bg_color = (30, 30, 35)
+    gap = 3
 
-    # 第 2 幅：增强图 — 列出所有启用步骤
-    enhance_steps = []
-    if gamma != 1.0:
-        enhance_steps.append("γ=%.2f" % gamma)
-    enhance_steps.append("Bilateral")
-    if median_ksize >= 3:
-        enhance_steps.append("Median")
-    enhance_steps.append("CLAHE")
-    enhance_steps.append("UnsharpMask")
-    label2 = "2. " + " → ".join(enhance_steps)
+    # ── 收集所有步骤（按流水线顺序）──
+    all_steps = []
 
-    # 第 3 幅：自适应阈值二值图
-    post_parts = []
-    if config.preprocess.morph_open_enabled:
-        post_parts.append("MorphOpen(k=%d)" % config.preprocess.morph_open_kernel_size)
-    if config.preprocess.cc_filter_enabled:
-        post_parts.append("CCFilter(min=%d)" % config.preprocess.cc_min_area)
-    post_suffix = " → " + " → ".join(post_parts) if post_parts else ""
-    label3 = "3. AdaptiveBinary(blk=%d,C=%d)%s → 黑=刻度/白=背景" % (
-        config.preprocess.adaptive_block_size,
-        config.preprocess.adaptive_C,
-        post_suffix)
+    # 步骤 1: 原始 BGR 图
+    all_steps.append(('01_original', '1. 原始图像 (BGR)', original))
 
-    labels = [label1, label2, label3]
-    imgs = [orig_r, enh_r, ba_r]
+    # 步骤 2~10: 按 intermediates key 顺序
+    step_defs = [
+        ('01_gray',       '2. 灰度化',                   (255, 255, 255)),
+        ('02_gamma',      f'3. Gamma 校正 (γ={gamma:.2f})', (255, 200, 100)),
+        ('03_gauss',      '4. 高斯模糊前置',              (180, 180, 220)),
+        ('04_bilateral',  f'5. 双边滤波 (d={config.preprocess.bilateral_d},σ={config.preprocess.bilateral_sigma:.0f})', (160, 220, 160)),
+        ('05_median',     f'6. 中值滤波 (k={median_ksize})', (200, 180, 120)),
+        ('06_clahe',      f'7. CLAHE (clip={config.preprocess.clahe_clip_limit})', (120, 200, 255)),
+        ('07_unsharp',    f'8. 锐化 (amount={config.preprocess.unsharp_amount})', (220, 160, 200)),
+        ('08_adaptive_bin',f'9. 自适应二值化 (blk={config.preprocess.adaptive_block_size},C={config.preprocess.adaptive_C})', (100, 255, 160)),
+        ('09_morph_open', '10. 形态学开运算',               (200, 200, 120)),
+        ('10_cc_filter',  '11. 连通域过滤',                 (255, 180, 120)),
+    ]
 
-    gap = 4
-    out_h = nh + 10
-    out_w = nw * 3 + gap * 2
+    for key, name, color in step_defs:
+        img_i = intermediates.get(key)
+        if img_i is not None:
+            all_steps.append((key, name, img_i, color))
+        elif key in ('09_morph_open', '10_cc_filter'):
+            # 后处理步骤即使跳过也显示说明
+            pass
+        elif key == '03_gauss':
+            # 高斯模糊可能跳过
+            pass
+        else:
+            # 核心步骤一定有
+            pass
+
+    # ── 实际显示步骤数 ──
+    disp_steps = []
+    for item in all_steps:
+        if len(item) == 3:
+            key, name, img_i = item
+            color = (200, 200, 200)
+        else:
+            key, name, img_i, color = item
+        disp_steps.append((name, _resize_gray(img_i), color))
+
+    n = len(disp_steps)
+    cols = 4
+    rows = (n + cols - 1) // cols
+
+    # ── 组装画布 ──
+    label_h = 20
+    out_w = cols * cell_w + gap * (cols - 1) + 16
+    out_h = rows * (cell_h + label_h + gap) + gap + 30
     vis = np.zeros((out_h, out_w, 3), dtype=np.uint8)
-    vis[:] = (30, 30, 35)
+    vis[:] = bg_color
 
-    for i, (img, label) in enumerate(zip(imgs, labels)):
-        x0 = i * (nw + gap)
-        ch, cw = img.shape[:2]
-        vis[:ch, x0:x0 + cw] = img
-        cv2.putText(vis, label, (x0 + 8, 22),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    for idx, (name, img_bgr, color) in enumerate(disp_steps):
+        r = idx // cols
+        c = idx % cols
+        x0 = 8 + c * (cell_w + gap)
+        y0 = gap + r * (cell_h + label_h + gap)
 
-    cv2.putText(vis, "STEP 0: Preprocessing", (5, out_h - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 125), 1)
+        # 放图像
+        vis[y0:y0 + cell_h, x0:x0 + cell_w] = img_bgr
+
+        # 放标签
+        bar_y = y0 + cell_h
+        bar = np.zeros((label_h, cell_w, 3), dtype=np.uint8)
+        bar[:] = (35, 35, 40)
+        cv2.putText(bar, name, (3, label_h - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, color, 1)
+        vis[bar_y:bar_y + label_h, x0:x0 + cell_w] = bar
+
+    # ── 底部步骤条：标注最终输出 → 黑=刻度前景, 白=背景 ──
+    cv2.putText(vis, "STEP 0: Preprocessing Pipeline — 黑=刻度前景 / 白=背景",
+                (8, out_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 145), 1)
 
     return vis

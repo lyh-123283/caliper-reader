@@ -35,19 +35,12 @@ def split_scales(rotated_gray: np.ndarray,
     else:
         binary = rotated_binary
 
-    # ── 提取所有刻线的垂直分布（用于验证两侧 tick 密度）──
-    tick_xs = _extract_vertical_feature_positions(binary, w)
-
-    # ── 方案A（优先）：水平投影突变法 ──
-    split_y = _split_by_projection(rotated_gray, binary, tick_xs, h, w)
-
-    # ── 方案B 回退：灰度梯度法 ──
+    # Prefer the top of the vernier tick row.  The visual boundary between
+    # the two metal parts is often at the bottom of those ticks; cutting
+    # there removes the very marks the next stage needs.
+    split_y = _split_by_vernier_tick_band(rotated_gray, binary, h, w)
     if split_y is None:
-        split_y = _split_by_gradient(rotated_gray, binary, tick_xs, h, w)
-
-    # ── 方案C 回退：二值闭运算投影法 ──
-    if split_y is None:
-        split_y = _split_by_binary_close(binary, tick_xs, h, w)
+        split_y = _split_by_candidate_scan(rotated_gray, binary, h, w)
 
     # ── 最终回退（基于物理先验：主尺约占ROI高度的60%）──
     if split_y is None:
@@ -85,189 +78,123 @@ def split_scales(rotated_gray: np.ndarray,
     }
 
 
-# ═══════════════════════════════════════════════════════════
-#  方案A（优先）：水平投影突变法
-# ═══════════════════════════════════════════════════════════
-
-def _split_by_projection(gray: np.ndarray, binary: np.ndarray,
-                          tick_xs: np.ndarray, h: int, w: int):
-    """
-    主尺/游标分界检测 — v6.1: Sobel Y 找面板上沿，再回退到面板上方的窄白缝。
-
-    最强水平边缘 = 游标尺面板**上沿**（金属→暗压块跳变），但游标尺
-    刻度线本身也跨过这条边缘（从主尺数字行底部一直到面板下方），
-    若直接以此为 split_y，会把游标尺刻度切成两半。
-
-    正确做法：在 best_y 上方往上找"hproj 行像素均值的局部最大（亮带）" →
-    即主尺数字行底部和游标尺面板顶部之间的窄白缝。
-
-    步骤：
-      1. Sobel Y → OTSU → 水平投影找最强 y（游标尺面板上沿，记为 panel_top_y）
-      2. 在 [panel_top_y - 60, panel_top_y - 5] 范围内做 gray 行均值
-      3. 找该范围内 gray 均值最大的 y（白缝处）即为 split_y
-    """
-    if gray is None:
+def _split_by_vernier_tick_band(gray: np.ndarray, binary: np.ndarray,
+                                h: int, w: int):
+    """用中心区域梯度最大处定位分界线。"""
+    lo, hi = int(h * 0.42), int(h * 0.70)
+    if hi <= lo:
         return None
-    h_full = h
 
+    x1, x2 = int(w * 0.28), int(w * 0.70)
+    if x2 <= x1:
+        x1, x2 = 0, w
+
+    row_mean = np.mean(gray[:, x1:x2], axis=1).astype(float)
+    win = max(7, h // 70)
+    if win % 2 == 0:
+        win += 1
+    kernel = np.ones(win, dtype=float) / win
+    smooth = np.convolve(row_mean, kernel, mode='same')
+    grad = np.abs(np.gradient(smooth))
+
+    # 只取搜索窗口内的梯度
+    grad[0:lo] = 0
+    grad[hi:] = 0
+
+    best_y = int(np.argmax(grad))
+
+    if float(grad[best_y]) < 2.0:
+        return None
+
+    split_y = max(int(h * config.region_split.search_lo_ratio), best_y - max(8, h // 55))
+    return _snap_split_to_min_gradient(gray, split_y, lo, hi)
+
+
+def _split_by_candidate_scan(gray: np.ndarray, binary: np.ndarray,
+                             h: int, w: int):
+    """候选扫描：用亮度空带 + 刻线间距 + 双侧覆盖联合打分。"""
     lo, hi = int(h * config.region_split.search_lo_ratio), int(h * config.region_split.search_hi_ratio)
     if hi <= lo:
         return None
 
-    # Sobel Y → 强水平边缘
-    sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=5)
-    abs_y = np.abs(sobel_y)
-    g_max = float(np.max(abs_y))
-    if g_max <= 0:
-        return None
-    abs_y_u8 = (abs_y / g_max * 255).astype(np.uint8)
-    _, bw = cv2.threshold(abs_y_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    hproj_edge = np.sum(bw == 255, axis=1).astype(float)
-
-    region_proj = hproj_edge[lo:hi + 1]
-    if len(region_proj) < 10:
-        return None
-    best_rel = int(np.argmax(region_proj))
-    panel_top_y = best_rel + lo
-    best_strength = float(region_proj[best_rel])
-    if best_strength < float(np.max(hproj_edge)) * 0.30:
-        return None
-
-    # ── v6.2: 在 panel_top_y 上方做固定回退（这种卡尺主尺刻度行紧贴游标尺面板，
-    #     没有白缝；强行回退 ~10% ROI 高度，让主尺刻度行完整归入主尺区）──
-    retreat_px = max(15, int(h_full * 0.07))
-    split_y = max(lo, panel_top_y - retreat_px)
-    return split_y
-
-
-# ═══════════════════════════════════════════════════════════
-#  方案B（回退）：灰度梯度法
-# ═══════════════════════════════════════════════════════════
-
-def _split_by_gradient(gray: np.ndarray, binary: np.ndarray,
-                        tick_xs: np.ndarray, h: int, w: int):
-    """梯度法找分界线 + 刻线密度验证"""
-    clahe = cv2.createCLAHE(
-        clipLimit=config.region_split.clahe_clip_limit,
-        tileGridSize=(config.region_split.clahe_tile_w, config.region_split.clahe_tile_h))
-    enhanced = clahe.apply(gray)
-    sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=3)
-    abs_grad = np.abs(sobel_y)
-    grad_proj = np.sum(abs_grad, axis=1).astype(float)
-    if np.max(grad_proj) > 0:
-        grad_proj /= np.max(grad_proj)
-
-    lo, hi = int(h * config.region_split.search_lo_ratio), int(h * config.region_split.search_hi_ratio)
-    if hi <= lo:
-        return None
-
-    # 收集多个候选峰值
-    mean_val = float(np.mean(grad_proj[lo:hi]))
-    thresh = max(mean_val * config.region_split.gradient_threshold_factor,
-                 config.region_split.gradient_min_thresh)
-    grad_region = grad_proj[lo:hi]
-    candidates = _find_local_peaks(grad_region, min_dist=5, threshold=thresh)
-    candidates = [lo + p for p in candidates]
-
-    if not candidates:
-        return None
-
-    # 按 tick-density 打分，取最优
     band = max(h // config.region_split.density_band_ratio_denom,
                config.region_split.density_band_min)
-    best_y, best_score = None, -1
-    for cy in candidates:
-        score = _tick_density_score(binary, tick_xs, h, w, cy, band)
+    gray_means = np.mean(gray, axis=1).astype(float)
+    row_mean_min = float(np.min(gray_means[lo:hi + 1]))
+    row_mean_max = float(np.max(gray_means[lo:hi + 1]))
+    row_mean_span = max(row_mean_max - row_mean_min, 1.0)
+
+    best_y = None
+    best_score = -1.0
+    for cy in range(lo + band, hi - band):
+        y1 = max(0, cy - band // 2)
+        y2 = min(h, cy + band // 2)
+        if y2 <= y1:
+            continue
+
+        band_density = float(np.mean(binary[y1:y2, :] > 0))
+        if band_density > 0.45:
+            continue
+
+        above_zone = binary[max(0, cy - band):cy, :]
+        below_zone = binary[cy:min(h, cy + band), :]
+        above_cov, above_gap = _equispaced_coverage(above_zone, w)
+        below_cov, below_gap = _equispaced_coverage(below_zone, w)
+        if above_cov < 0.22 or below_cov < 0.22:
+            continue
+        if above_gap <= 0 or below_gap <= 0:
+            continue
+
+        ratio = above_gap / below_gap if above_gap > below_gap else below_gap / above_gap
+        if ratio < 1.15 or ratio > 4.5:
+            continue
+        ratio_score = max(0.0, 1.0 - abs(ratio - 2.0) / 1.5)
+        cover_score = min(1.0, above_cov * below_cov * 1.5)
+        gap_score = 1.0 - band_density
+        bright_score = (gray_means[cy] - row_mean_min) / row_mean_span
+        score = 0.42 * ratio_score + 0.28 * cover_score + 0.22 * gap_score + 0.08 * bright_score
+
         if score > best_score:
             best_score = score
             best_y = cy
 
-    if best_score < config.region_split.density_min_score:
+    if best_y is None or best_score < 0.35:
         return None
 
-    return best_y
+    return _snap_to_brightest_gap(gray, best_y, band, lo, hi)
 
 
-def _split_by_binary_close(binary: np.ndarray, tick_xs: np.ndarray,
-                            h: int, w: int):
-    """二值图闭运算投影找分界线 + 刻线密度验证"""
-    kernel_w = max(int(w * config.region_split.close_kernel_ratio), 30)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-    hproj = np.sum(closed, axis=1).astype(float)
-    if np.max(hproj) > 0:
-        hproj /= np.max(hproj)
-
-    lo, hi = int(h * config.region_split.search_lo_ratio), int(h * config.region_split.search_hi_ratio)
-    if hi <= lo:
-        return None
-
-    # 收集多个谷值候选
-    hproj_region = 1.0 - hproj[lo:hi]  # 反转：谷变峰
-    candidates = _find_local_peaks(hproj_region, min_dist=5, threshold=0.02)
-    candidates = [lo + p for p in candidates]
-
-    if not candidates:
-        return None
-
-    band = max(h // 20, 8)
-    best_y, best_score = None, -1
-    for cy in candidates:
-        score = _tick_density_score(binary, tick_xs, h, w, cy, band)
-        if score > best_score:
-            best_score = score
-            best_y = cy
-
-    if best_score < 4:
-        return None
-    return best_y
+def _snap_to_brightest_gap(gray: np.ndarray, center_y: int, band: int,
+                           lo: int, hi: int) -> int:
+    """在 center_y 附近吸附到最亮的空带行。"""
+    half = max(4, band // 2)
+    win_lo = max(lo, center_y - half)
+    win_hi = min(hi, center_y + half)
+    if win_hi <= win_lo:
+        return center_y
+    row_means = np.mean(gray[win_lo:win_hi + 1, :], axis=1)
+    return win_lo + int(np.argmax(row_means))
 
 
-def _tick_density_score(binary: np.ndarray, tick_xs: np.ndarray,
-                         h: int, w: int, cy: int, band: int) -> float:
-    """
-    对候选分割线打分。
-
-    v5.7 关键洞察：游标尺刻度密度 ≈ 主尺密度的 1.7~2 倍（20 分度卡尺）。
-    因此分界点的物理特征是：
-      • 上方 band 内是"间距 g_above 的等间距刻线行"
-      • 下方 band 内是"间距 g_below 的等间距刻线行"
-      • g_above / g_below ∈ [1.4, 3.5]（主尺/游标的合理比值范围）
-    切在同一行刻度内部时 g_above ≈ g_below ≈ 同一值 → 比值 ≈ 1 → 低分。
-    """
-    y1 = max(0, cy - band)
-    y2 = min(h - 1, cy + band)
+def _snap_split_to_min_gradient(gray: np.ndarray, split_y: int, lo: int, hi: int) -> int:
+    """Nudge the split to the local minimum gradient near the candidate edge."""
+    half = 4
+    y1 = max(lo, split_y - half)
+    y2 = min(hi, split_y + half)
     if y2 <= y1:
-        return 0.0
+        return split_y
 
-    above_zone = binary[y1:cy + 1, :]
-    below_zone = binary[cy:y2 + 1, :]
+    x1, x2 = int(gray.shape[1] * 0.28), int(gray.shape[1] * 0.70)
+    if x2 <= x1:
+        x1, x2 = 0, gray.shape[1]
 
-    # ── 计算上下两侧的"等间距覆盖系数 + tick_gap" ──
-    above_cov, above_gap = _equispaced_coverage(above_zone, w)
-    below_cov, below_gap = _equispaced_coverage(below_zone, w)
+    band = gray[y1:y2 + 1, x1:x2]
+    if band.size == 0:
+        return split_y
 
-    # 任一侧没有"足够等间距覆盖"（< 30%）→ 直接淘汰
-    if above_cov < 0.30 or below_cov < 0.30:
-        return 0.0
-
-    if above_gap <= 0 or below_gap <= 0:
-        return 0.0
-
-    # ── 主尺/游标比值打分 ──
-    #     比值 ≈ 1.0 → 切在同一行内部（淘汰）
-    #     比值 ≈ 1.7~2.0 → 完美主尺/游标分界（最高分）
-    #     比值 > 3.5 或 < 1.0 → 不合理
-    ratio = above_gap / below_gap if above_gap > below_gap else below_gap / above_gap
-    if ratio < 1.30 or ratio > 3.50:
-        return 0.0
-
-    # 距离理想比值 2.0 的近度（0~1，越接近 2.0 越高）
-    closeness = max(0.0, 1.0 - abs(ratio - 2.0) / 1.5)
-
-    # 综合得分 = 双侧覆盖乘积 × 比值近度 × 100
-    base = above_cov * below_cov  # 0~1
-    return float(base * (0.5 + closeness * 1.5) * 100.0)
+    means = np.mean(band, axis=1).astype(float)
+    grads = np.abs(np.gradient(means))
+    return y1 + int(np.argmin(grads))
 
 
 def _equispaced_coverage(zone_binary: np.ndarray, w: int):

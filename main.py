@@ -4,12 +4,32 @@
 支持查看每一步处理的中间输出图像
 """
 
+import os
+import sys
+import ctypes
+
+
+def _bootstrap_tk_paths():
+    """Make tkinter use the bundled Tcl/Tk scripts on Windows."""
+    base_dir = os.path.dirname(sys.executable)
+    tcl_dll = os.path.join(base_dir, "DLLs", "tcl86t.dll")
+    if os.path.exists(tcl_dll):
+        try:
+            tcl = ctypes.CDLL(tcl_dll)
+            tcl.Tcl_FindExecutable.argtypes = [ctypes.c_wchar_p]
+            tcl.Tcl_FindExecutable.restype = None
+            tcl.Tcl_FindExecutable(sys.executable)
+        except Exception:
+            pass
+
+
+_bootstrap_tk_paths()
+
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
 from PIL import Image, ImageTk
 import cv2
 import numpy as np
-import os
 import threading
 
 from caliper import CaliperPipeline, CaliperResult
@@ -41,17 +61,9 @@ class CaliperApp:
         self.current_image: np.ndarray = None
         self.current_result: CaliperResult = None
         self._is_processing = False
+        self._latest_file_path = ""
+        self._auto_follow_progress = True
 
-        # 手动 ROI 框选状态
-        self.manual_roi_mode = False
-        self.roi_start_x = None
-        self.roi_start_y = None
-        self.roi_drawing = False
-        self.roi_rect = None  # (x1, y1, x2, y2) 或 None
-        self.roi_scale_x = 1.0  # 显示缩放比例
-        self.roi_scale_y = 1.0
-
-        # 手动零线状态
         # 动态标签页
         self.tab_widgets = {}
         self.tab_keys = []
@@ -65,19 +77,6 @@ class CaliperApp:
                         background=self.bg_color, foreground=self.fg_color)
 
         self._build_ui()
-
-    def _on_precision_changed(self, event=None):
-        """精度下拉框变更"""
-        val = self.precision_var.get()
-        if val == "自动":
-            self.pipeline.set_precision_override(None)
-        elif val == "0.1 mm":
-            self.pipeline.set_precision_override(0.1)
-        elif val == "0.05 mm":
-            self.pipeline.set_precision_override(0.05)
-        elif val == "0.02 mm":
-            self.pipeline.set_precision_override(0.02)
-
 
     def _build_ui(self):
         """构建界面"""
@@ -139,32 +138,6 @@ class CaliperApp:
         )
         self.btn_open.pack(fill=tk.X, pady=(0, 10))
 
-        # 手动框选ROI按钮
-        self.btn_manual_roi = tk.Button(
-            inner, text="✏️ 手动框选刻度区域", font=('Microsoft YaHei', 10, 'bold'),
-            bg="#45475a", fg=self.warn_color,
-            activebackground="#585b70", activeforeground=self.warn_color,
-            relief=tk.FLAT, cursor="hand2", padx=15, pady=8,
-            command=self._start_manual_roi, state=tk.NORMAL
-        )
-        self.btn_manual_roi.pack(fill=tk.X, pady=(0, 8))
-
-        # 精度手动选择
-        prec_frame = tk.Frame(inner, bg=self.card_color)
-        prec_frame.pack(fill=tk.X, pady=(0, 10))
-        tk.Label(prec_frame, text="精度:", font=('Microsoft YaHei', 9),
-                 bg=self.card_color, fg="#a6adc8").pack(side=tk.LEFT)
-        self.precision_var = tk.StringVar(value="自动")
-        self.precision_combo = ttk.Combobox(
-            prec_frame, textvariable=self.precision_var,
-            values=["自动", "0.1 mm", "0.05 mm", "0.02 mm"],
-            state="readonly", width=10, font=('Microsoft YaHei', 9)
-        )
-        self.precision_combo.pack(side=tk.RIGHT)
-        self.precision_combo.bind("<<ComboboxSelected>>", self._on_precision_changed)
-
-        ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
-
         # 结果展示区
         tk.Label(
             inner, text="📋 识别结果", font=('Microsoft YaHei', 13, 'bold'),
@@ -178,7 +151,7 @@ class CaliperApp:
         result_inner.pack(fill=tk.X, padx=12, pady=12)
 
         # 精度
-        tk.Label(result_inner, text="检测精度", font=('Microsoft YaHei', 9),
+        tk.Label(result_inner, text="支持精度", font=('Microsoft YaHei', 9),
                  bg=self.bg_color, fg="#6c7086").pack(anchor=tk.W)
         self.lbl_precision = tk.Label(
             result_inner, text="-- mm", font=('Consolas', 16, 'bold'),
@@ -235,6 +208,11 @@ class CaliperApp:
             bg=self.bg_color, fg="#585b70"
         )
         self.lbl_ocr_engine.pack(anchor=tk.W, pady=(6, 0))
+        self.lbl_ocr_result = tk.Label(
+            result_inner, text="OCR result: --", font=('Consolas', 9),
+            bg=self.bg_color, fg="#6c7086"
+        )
+        self.lbl_ocr_result.pack(anchor=tk.W, pady=(2, 0))
 
         ttk.Separator(inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=10)
 
@@ -249,7 +227,7 @@ class CaliperApp:
             "2. 确保游标卡尺刻度清晰可见",
             "3. 尽量垂直拍摄，光线均匀",
             "4. 支持 jpg / png / bmp 格式",
-            "5. 自动检测 0.02/0.05/0.1 精度",
+            "5. 固定支持 0.02 mm 精度",
             "6. 右侧标签页可查看每步中间结果",
             "7. 安装 EasyOCR 可启用数字识别",
         ]
@@ -382,15 +360,14 @@ class CaliperApp:
         self.img_canvas.bind("<Button-4>", lambda e: self._on_mousewheel_alt(1))
         self.img_canvas.bind("<Button-5>", lambda e: self._on_mousewheel_alt(-1))
 
-    def _build_dynamic_tabs(self, debug_images: dict):
-        """根据 debug_images 动态构建标签页"""
-        # 清空旧标签页
-        for w in self.tab_container.winfo_children():
-            w.destroy()
-        self.tab_widgets.clear()
-        self.tab_keys.clear()
+    def _build_dynamic_tabs(self, debug_images: dict, reset: bool = False):
+        """根据 debug_images 更新标签页；reset=True 时重建整组标签。"""
+        if reset:
+            for w in self.tab_container.winfo_children():
+                w.destroy()
+            self.tab_widgets.clear()
+            self.tab_keys.clear()
 
-        # 原图放在第一个
         all_keys = ['原图'] if self.current_image is not None else []
         all_keys.extend(sorted(debug_images.keys()))
         all_keys.append('最终标注')
@@ -403,7 +380,9 @@ class CaliperApp:
             'fg': self.fg_color,
         }
 
-        for i, key in enumerate(all_keys):
+        for key in all_keys:
+            if key in self.tab_widgets:
+                continue
             # 缩短显示名
             display = key.replace('_', ' ').replace('a', '').replace('b', '').replace('c', '')
             if len(display) > 10:
@@ -415,9 +394,48 @@ class CaliperApp:
             self.tab_widgets[key] = lbl
             self.tab_keys.append(key)
 
-        # 默认选中第一个
-        if self.tab_keys:
+        if reset and self.tab_keys:
             self._switch_tab(self.tab_keys[0])
+
+    def _refresh_dynamic_tabs(self, select_tab: str = None):
+        """Rebuild tabs while keeping the current selection when possible."""
+        previous_tab = self.current_tab
+        self._build_dynamic_tabs(
+            self.current_result.debug_images if self.current_result else {},
+            reset=False,
+        )
+        target = select_tab or previous_tab
+        if target in self.tab_widgets:
+            self._switch_tab(target)
+
+    def _make_pending_result(self) -> CaliperResult:
+        """Create a temporary result object while the pipeline is still running."""
+        return CaliperResult(
+            main_scale=0.0,
+            vernier_scale=0.0,
+            total=0.0,
+            precision=0.0,
+            confidence=0.0,
+            image_annotated=None,
+            debug_images={},
+        )
+
+    def _on_pipeline_progress(self, step_key: str, image: np.ndarray, status: str):
+        """Receive a finished pipeline step from the worker thread."""
+        if self.current_result is None:
+            self.current_result = self._make_pending_result()
+        self.current_result.debug_images[step_key] = image
+        should_follow = self._auto_follow_progress or self.current_tab in ("", "原图")
+        if step_key not in self.tab_widgets:
+            self._build_dynamic_tabs(self.current_result.debug_images, reset=False)
+        if should_follow:
+            self._switch_tab(step_key)
+        elif self.current_tab == step_key:
+            self._display_image(image)
+        if should_follow:
+            self._auto_follow_progress = True
+        self.status_label.config(text=f"处理中: {status}")
+        self.root.update_idletasks()
 
     def _switch_tab(self, tab: str):
         """切换标签页"""
@@ -461,6 +479,8 @@ class CaliperApp:
             return
 
         self._is_processing = True
+        self._latest_file_path = file_path
+        self._auto_follow_progress = True
         self.btn_open.config(state=tk.DISABLED)
         self.btn_save.config(state=tk.DISABLED, bg="#45475a", fg=self.fg_color)
         self.status_label.config(text=f"⏳ 正在识别: {os.path.basename(file_path)} ...")
@@ -472,19 +492,33 @@ class CaliperApp:
                 if img is None:
                     raise ValueError("无法读取图像文件，请确认文件格式正确。")
 
-                result = self.pipeline.run(img)
+                def progress(step_key, image, status):
+                    self.root.after(
+                        0,
+                        lambda k=step_key, im=image, s=status:
+                            self._on_pipeline_progress(k, im, s)
+                    )
+
+                self.root.after(0, lambda: self._on_image_loaded_for_progress(img))
+                result = self.pipeline.run(img, progress_callback=progress)
                 self.root.after(0, lambda: self._on_image_processed(img, result, file_path))
             except Exception as e:
                 self.root.after(0, lambda: self._on_image_process_error(e))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _on_image_loaded_for_progress(self, img: np.ndarray):
+        self.current_image = img
+        self.current_result = self._make_pending_result()
+        self._build_dynamic_tabs(self.current_result.debug_images, reset=True)
+        self._switch_tab('原图')
+
     def _on_image_processed(self, img: np.ndarray, result: CaliperResult, file_path: str):
         self.current_image = img
         self.current_result = result
 
         self._show_result(result)
-        self._build_dynamic_tabs(result.debug_images)
+        self._build_dynamic_tabs(result.debug_images, reset=False)
 
         self.btn_save.config(state=tk.NORMAL, bg=self.accent_color, fg="#1e1e2e")
         self.btn_open.config(state=tk.NORMAL)
@@ -536,8 +570,18 @@ class CaliperApp:
         else:
             self.lbl_ocr_engine.config(text=f"OCR: {status}", fg="#a6adc8")
 
-        # 显示额外信息
         extra = result.extra_info
+        deriv = extra.get('main_derivation', {}) if isinstance(extra, dict) else {}
+        ocr_text = deriv.get('ocr_text') if isinstance(deriv, dict) else None
+        ocr_conf = deriv.get('ocr_confidence') if isinstance(deriv, dict) else None
+        ocr_engine = deriv.get('ocr_engine') if isinstance(deriv, dict) else None
+        if ocr_text is not None:
+            conf_text = f"{ocr_conf:.2f}" if isinstance(ocr_conf, (int, float)) else "?"
+            self.lbl_ocr_result.config(text=f"OCR: {ocr_text}  conf={conf_text}")
+        else:
+            self.lbl_ocr_result.config(text=f"OCR: --  ({ocr_engine or 'no result'})")
+
+        # 显示额外信息
         if extra:
             info_parts = []
             if extra.get('main_ticks_count'):
@@ -608,10 +652,6 @@ class CaliperApp:
         # Scrollregion
         self.img_canvas.configure(scrollregion=(0, 0, dw, dh))
 
-        # roi 缩放比例（供手动框选用）
-        self.roi_scale_x = self._zoom_level
-        self.roi_scale_y = self._zoom_level
-
     def _on_canvas_resize(self, event=None):
         """Canvas 尺寸变化 → 重新渲染（保持缩放模式）"""
         if self._show_original is None:
@@ -621,17 +661,12 @@ class CaliperApp:
 
     def _on_scroll_y(self, *args):
         self.v_scrollbar.set(*args)
-        self.img_canvas.yview(*args)
 
     def _on_scroll_x(self, *args):
         self.h_scrollbar.set(*args)
-        self.img_canvas.xview(*args)
 
     def _on_canvas_press(self, event):
-        """鼠标按下 → 开始拖拽平移 / ROI 框选 / 指定零线"""
-        if self.manual_roi_mode:
-            self._roi_mouse_press(event)
-            return
+        """鼠标按下 → 开始拖拽平移"""
         self._pan_start_x = event.x
         self._pan_start_y = event.y
         self._pan_canvas_x = self.img_canvas.canvasx(0)
@@ -639,9 +674,6 @@ class CaliperApp:
 
     def _on_canvas_drag(self, event):
         """拖拽平移"""
-        if self.manual_roi_mode and self.roi_drawing:
-            self._roi_mouse_move(event)
-            return
         if self._show_original is None or self._zoom_fit_mode:
             return  # 适应窗口时无需拖拽
         dx = self._pan_start_x - event.x
@@ -652,8 +684,7 @@ class CaliperApp:
         self._pan_start_y = event.y
 
     def _on_canvas_release(self, event):
-        if self.manual_roi_mode:
-            self._roi_mouse_release(event)
+        return
 
     def _on_mousewheel(self, event):
         """Ctrl+鼠标滚轮 → 缩放"""
@@ -671,8 +702,6 @@ class CaliperApp:
 
     def _on_double_click(self, event):
         """双击切换 1:1 / 适应窗口"""
-        if self.manual_roi_mode:
-            return
         if self._zoom_fit_mode:
             self._zoom_100()
         else:
@@ -737,127 +766,6 @@ class CaliperApp:
             messagebox.showinfo("保存成功", f"标注图像已保存到:\n{file_path}")
         except Exception as e:
             messagebox.showerror("保存失败", str(e))
-
-
-# ═════════════════════════════════════════════════
-    #  手动 ROI 框选 (Canvas 模式 — 坐标天然对齐)
-    # ═════════════════════════════════════════════════
-
-    def _start_manual_roi(self):
-        if self.current_image is None:
-            messagebox.showinfo("提示", "请先打开一张图像文件！")
-            return
-
-        self.manual_roi_mode = True
-        self.roi_start_x = None
-        self.roi_start_y = None
-        self.roi_drawing = False
-        self.roi_rect = None
-
-        # 显示当前图像供框选（适应窗口）
-        if self._show_original is not self.current_image:
-            self._display_image(self.current_image)
-
-        self.img_canvas.configure(cursor="crosshair")
-
-        self.status_label.config(
-            text="🖱️ 请在图像上用鼠标拖拽框选刻度区域（主尺+游标尺），松开完成"
-        )
-        self.btn_manual_roi.config(text="⏳ 请在图中框选...", bg=self.warn_color, fg="#1e1e2e")
-
-    def _roi_mouse_press(self, event):
-        if not self.manual_roi_mode:
-            return
-        # canvasx/canvasy: 将组件坐标 → Canvas 逻辑坐标（含滚动偏移）
-        cx = self.img_canvas.canvasx(event.x)
-        cy = self.img_canvas.canvasy(event.y)
-        self.roi_start_x = int(cx / self.roi_scale_x) if self.roi_scale_x > 0 else int(cx)
-        self.roi_start_y = int(cy / self.roi_scale_y) if self.roi_scale_y > 0 else int(cy)
-        self.roi_drawing = True
-
-    def _roi_mouse_move(self, event):
-        if not self.manual_roi_mode or not self.roi_drawing:
-            return
-        if self.roi_start_x is None or self.roi_start_y is None:
-            return
-        if self.roi_scale_x <= 0 or self.roi_scale_y <= 0:
-            return
-        cx = self.img_canvas.canvasx(event.x)
-        cy = self.img_canvas.canvasy(event.y)
-        # 矩形在 Canvas 逻辑坐标系中绘制
-        sx_c = self.roi_start_x * self.roi_scale_x
-        sy_c = self.roi_start_y * self.roi_scale_y
-        if self.canvas_rect_id:
-            self.img_canvas.coords(self.canvas_rect_id, sx_c, sy_c, cx, cy)
-        else:
-            self.canvas_rect_id = self.img_canvas.create_rectangle(
-                sx_c, sy_c, cx, cy,
-                outline="#00ffc8", width=2, dash=(4, 2)
-            )
-
-    def _roi_mouse_release(self, event):
-        if not self.manual_roi_mode or not self.roi_drawing:
-            return
-        self.roi_drawing = False
-
-        cx = self.img_canvas.canvasx(event.x)
-        cy = self.img_canvas.canvasy(event.y)
-        ex = int(cx / self.roi_scale_x) if self.roi_scale_x > 0 else int(cx)
-        ey = int(cy / self.roi_scale_y) if self.roi_scale_y > 0 else int(cy)
-
-        x1 = max(0, min(self.roi_start_x, ex))
-        y1 = max(0, min(self.roi_start_y, ey))
-        x2 = min(self.current_image.shape[1], max(self.roi_start_x, ex))
-        y2 = min(self.current_image.shape[0], max(self.roi_start_y, ey))
-
-        if x2 - x1 < 20 or y2 - y1 < 20:
-            self.status_label.config(text="⚠️ 框选区域太小，请重新框选")
-            self.img_canvas.delete(self.canvas_rect_id)
-            self.canvas_rect_id = None
-            return
-
-        self.roi_rect = (x1, y1, x2, y2)
-
-        # 最终框选矩形（亮绿色实线）
-        dsx1, dsy1 = int(x1 * self.roi_scale_x), int(y1 * self.roi_scale_y)
-        dsx2, dsy2 = int(x2 * self.roi_scale_x), int(y2 * self.roi_scale_y)
-        self.img_canvas.delete(self.canvas_rect_id)
-        self.canvas_rect_id = self.img_canvas.create_rectangle(
-            dsx1, dsy1, dsx2, dsy2,
-            outline="#00ff50", width=3
-        )
-
-        # 恢复光标和模式
-        self.img_canvas.configure(cursor="hand1")
-        self.manual_roi_mode = False
-
-        self.status_label.config(text=f"✅ 已框选区域 ({x1},{y1})-({x2},{y2})，正在识别...")
-        self.btn_manual_roi.config(text="✏️ 手动框选刻度区域", bg="#45475a", fg=self.warn_color)
-        self.root.update()
-        self._run_with_manual_roi()
-
-    # ═════════════════════════════════════════════════
-    def _run_with_manual_roi(self):
-        if self.current_image is None or self.roi_rect is None:
-            return
-        try:
-            x1, y1, x2, y2 = self.roi_rect
-            self.current_result = self.pipeline.run_from_crop(
-                self.current_image, x1, y1, x2, y2
-            )
-            self._show_result(self.current_result)
-            self._build_dynamic_tabs(self.current_result.debug_images)
-            self.btn_save.config(state=tk.NORMAL, bg=self.accent_color, fg="#1e1e2e")
-            self.status_label.config(
-                text=f"✅ 手动ROI识别完成 | "
-                     f"精度: {self.current_result.precision:.2f}mm | "
-                     f"结果: {self.current_result.total:.3f}mm"
-            )
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            messagebox.showerror("识别错误", str(e))
-            self.status_label.config(text="❌ 识别失败")
 
 
 def main():

@@ -88,8 +88,10 @@ def extract_ticks_from_binary(binary: np.ndarray,
         if length < min_len_px:
             continue
 
+        x_refined = _refine_tick_x(binary, x, ys, ye,
+                                   search_radius=max(4, min(10, min_len_px // 2)))
         ticks.append({
-            'x': x,
+            'x': int(x_refined),
             'y_start': int(ys),
             'y_end': int(ye),
             'y_mid': int((ys + ye) / 2),
@@ -102,6 +104,139 @@ def extract_ticks_from_binary(binary: np.ndarray,
             t['is_long'] = t['length'] > ml * long_tick_factor
 
     return ticks
+
+
+def extract_ticks_from_anchor_band(binary: np.ndarray,
+                                   direction: str,
+                                   min_length_ratio: float = 0.20,
+                                   band_ratio: float = 0.35,
+                                   peak_min_dist: int = 3,
+                                   peak_threshold_factor: float = 0.15,
+                                   long_tick_factor: float = None) -> List[dict]:
+    """Detect vertical tick marks from the band next to the split line.
+
+    direction="up"   finds main-scale ticks growing upward from the split.
+    direction="down" finds vernier ticks growing downward from the split.
+    """
+    h, w = binary.shape[:2]
+    if h == 0 or w == 0:
+        return []
+
+    band_h = max(12, min(h, int(h * band_ratio)))
+    if direction == "up":
+        anchor_band = binary[h - band_h:h, :]
+        anchor_limit = h - max(6, int(h * 0.08))
+    else:
+        anchor_band = binary[:band_h, :]
+        anchor_limit = max(6, int(h * 0.08))
+
+    vproj = np.sum(anchor_band > 0, axis=0).astype(float)
+    if np.max(vproj) <= 0:
+        return []
+    vproj_norm = vproj / np.max(vproj)
+    approx_xs = find_peaks_adaptive(
+        vproj_norm,
+        min_dist=peak_min_dist,
+        threshold_factor=peak_threshold_factor,
+    )
+
+    min_len_px = max(6, int(h * min_length_ratio))
+    ticks = []
+    for px in approx_xs:
+        x = int(px)
+        if x < 3 or x >= w - 3:
+            continue
+
+        strip = binary[:, max(0, x - 3):min(w, x + 4)]
+        col = np.sum(strip, axis=1)
+        threshold = max(float(np.max(col)) * 0.40, 30.0)
+        indices = np.where(col > threshold)[0]
+        if len(indices) < min_len_px // 2:
+            continue
+
+        segs = contiguous_segments(indices, min_len=5)
+        if not segs:
+            continue
+
+        if direction == "up":
+            anchored = [s for s in segs if s[1] >= anchor_limit]
+            seg = max(anchored, key=lambda s: s[1] - s[0]) if anchored else max(segs, key=lambda s: s[1])
+        else:
+            anchored = [s for s in segs if s[0] <= anchor_limit]
+            seg = max(anchored, key=lambda s: s[1] - s[0]) if anchored else min(segs, key=lambda s: s[0])
+
+        ys, ye = seg
+        length = ye - ys
+        if length < min_len_px:
+            continue
+
+        x_refined = _refine_tick_x(binary, x, ys, ye,
+                                   search_radius=max(4, min(10, min_len_px // 2)))
+        ticks.append({
+            'x': int(x_refined),
+            'y_start': int(ys),
+            'y_end': int(ye),
+            'y_mid': int((ys + ye) / 2),
+            'length': int(length),
+        })
+
+    ticks = _dedupe_ticks_by_x(ticks)
+    if ticks:
+        ml = float(np.median([t['length'] for t in ticks]))
+        factor = long_tick_factor if long_tick_factor is not None else config.main_scale.long_tick_factor
+        for t in ticks:
+            t['is_long'] = t['length'] > ml * factor
+    return ticks
+
+
+def _dedupe_ticks_by_x(ticks: List[dict], min_gap: int = 3) -> List[dict]:
+    if not ticks:
+        return []
+    out = []
+    for t in sorted(ticks, key=lambda item: item['x']):
+        if out and abs(t['x'] - out[-1]['x']) <= min_gap:
+            if t['length'] > out[-1]['length']:
+                out[-1] = t
+        else:
+            out.append(t)
+    return out
+
+
+def _refine_tick_x(binary: np.ndarray,
+                   approx_x: int,
+                   y_start: int,
+                   y_end: int,
+                   search_radius: int = 6) -> int:
+    """Refine a coarse x position by looking for the densest vertical stroke."""
+    h, w = binary.shape[:2]
+    if h == 0 or w == 0:
+        return int(approx_x)
+
+    x1 = max(0, int(approx_x) - search_radius)
+    x2 = min(w - 1, int(approx_x) + search_radius)
+    if x2 <= x1:
+        return int(approx_x)
+
+    y1 = max(0, int(y_start) - 1)
+    y2 = min(h - 1, int(y_end) + 1)
+    if y2 <= y1:
+        return int(approx_x)
+
+    crop = binary[y1:y2 + 1, x1:x2 + 1]
+    if crop.size == 0:
+        return int(approx_x)
+
+    col_scores = np.sum(crop > 0, axis=0).astype(float)
+    if not np.any(col_scores > 0):
+        return int(approx_x)
+
+    best = np.max(col_scores)
+    best_idx = np.where(col_scores == best)[0]
+    if len(best_idx) == 0:
+        return int(approx_x)
+
+    refined = x1 + int(round(float(np.mean(best_idx))))
+    return max(0, min(w - 1, refined))
 
 
 def contiguous_segments(indices: np.ndarray, min_len: int = 5) -> List[tuple]:

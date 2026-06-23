@@ -151,8 +151,8 @@ class OrientConfig:
     trim_ratio: float = 0.1     # 两端各去掉 10%
 
     # ── 旋转阈值 ──
-    #     小于此角度的不做旋转（避免微小抖动）
-    rotate_min_angle: float = 1.5
+    #     小于此角度的不做旋转（避免微小抖动 + HoughLinesP 随机噪声）
+    rotate_min_angle: float = 0.3
     #     大于此角度认为是检测错误
     rotate_max_angle: float = 80.0
 
@@ -224,8 +224,6 @@ class MainScaleConfig:
 
     # ── 长/短刻线判定 ──
     #     is_long = length > median_length * factor
-    #     v6.5: 调回 1.3（1.6 太严——主尺真长刻度只比短刻度长 30%，
-    #     导致 is_long 几乎全 false，OCR 无法定位 cm 标记）
     long_tick_factor: float = 1.3
 
     # ── 等间距补全 & 校验 (refine_ticks_by_spacing) ──
