@@ -475,8 +475,11 @@ def _refine_roi_by_vernier_block(enhanced: np.ndarray,
     if x2 - x1 < 100 or y2 - y1 < 100:
         return None
 
-    # ── 1. y 边界：用 Sobel Y 找最强两条水平边缘 ──
-    new_y1, new_y2 = _find_caliper_y_edges(enhanced, x1, x2, y1, y2)
+    # ── 1. y 边界：用读数区左中段找水平边缘 ──
+    # 候选 x 段过宽时，右侧长尺尾部/滑块水平边会把上沿拉偏。
+    # y 边界只需要读数区的代表性水平边，因此先收窄用于估计的 x 窗口。
+    y_edge_x1, y_edge_x2 = _select_y_edge_x_window(x1, x2, W)
+    new_y1, new_y2 = _find_caliper_y_edges(enhanced, y_edge_x1, y_edge_x2, y1, y2)
     if new_y1 is None or new_y2 is None or new_y2 - new_y1 < 80:
         new_y1, new_y2 = y1, y2
     else:
@@ -501,6 +504,24 @@ def _refine_roi_by_vernier_block(enhanced: np.ndarray,
     if new_x2 - new_x1 < 100 or new_y2 - new_y1 < 80:
         return None
     return new_y1, new_y2, new_x1, new_x2
+
+
+def _select_y_edge_x_window(x1: int, x2: int, image_w: int) -> Tuple[int, int]:
+    """Choose a stable x window for ROI y-edge detection."""
+    x1 = max(0, int(x1))
+    x2 = min(image_w - 1, int(x2))
+    span = x2 - x1
+    if span <= 0:
+        return x1, x2
+
+    # Wide spans often include the right ruler tail and upper slider edge.
+    # Keep the left/middle readout area, where main/vernier scales overlap.
+    if span > image_w * 0.55:
+        nx1 = x1 + int(span * 0.02)
+        nx2 = x1 + int(span * 0.85)
+        if nx2 - nx1 >= 300:
+            return nx1, nx2
+    return x1, x2
 
 
 def _find_caliper_y_edges(enhanced: np.ndarray,
@@ -750,10 +771,13 @@ def orient_caliper(roi_color: np.ndarray,
     """
     gray = roi_gray if roi_gray is not None else cv2.cvtColor(roi_color, cv2.COLOR_BGR2GRAY)
 
+    # Use a temporary contrast-normalized image only for orientation detection.
+    # The downstream scale recognizers should receive the preprocessed ROI gray
+    # directly, not a second CLAHE pass.
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    orient_gray = clahe.apply(gray)
 
-    edges = cv2.Canny(enhanced, config.orient.canny_low, config.orient.canny_high)
+    edges = cv2.Canny(orient_gray, config.orient.canny_low, config.orient.canny_high)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
                             threshold=config.orient.hough_threshold,
                             minLineLength=config.orient.hough_min_length,
@@ -762,7 +786,7 @@ def orient_caliper(roi_color: np.ndarray,
     if lines is None or len(lines) == 0:
         return {
             'rotated_color': roi_color,
-            'rotated_gray': enhanced,
+            'rotated_gray': gray,
             'rotated_binary': roi_binary,
             'orient_angle': 0.0,
             'orient_vis': roi_color,
@@ -782,7 +806,7 @@ def orient_caliper(roi_color: np.ndarray,
     if not angles:
         return {
             'rotated_color': roi_color,
-            'rotated_gray': enhanced,
+            'rotated_gray': gray,
             'rotated_binary': roi_binary,
             'orient_angle': 0.0,
             'orient_vis': roi_color,
@@ -809,7 +833,7 @@ def orient_caliper(roi_color: np.ndarray,
         angle = 0.0
 
     rotated_color = rotate_image(roi_color, angle)
-    rotated_gray = rotate_image(enhanced, angle)
+    rotated_gray = rotate_image(gray, angle)
     rotated_binary = rotate_image(roi_binary, angle) if roi_binary is not None else None
 
     orient_vis = _make_orient_vis(roi_color, rotated_color, angle)

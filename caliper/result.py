@@ -34,7 +34,7 @@ class CaliperResult:
     main_scale: float        # 主尺整数读数 (mm)
     vernier_scale: float     # 游标小数读数 (mm)
     total: float             # 总读数 (mm)
-    precision: float         # 检测精度 (0.02/0.05/0.1)
+    precision: float         # 检测精度，当前固定为 0.02mm
     confidence: float        # 总置信度 (0~1)
     image_annotated: np.ndarray = None  # 最终标注图像
     debug_images: dict = field(default_factory=dict)  # 各步骤中间图像

@@ -47,6 +47,17 @@ def find_peaks_adaptive(signal: np.ndarray, min_dist: int = 3,
     return np.array(peaks, dtype=int)
 
 
+def _tick_row_threshold(col: np.ndarray,
+                        max_factor: float = 0.40,
+                        single_stroke_cap: float = 0.80) -> float:
+    """Threshold a 7px-wide vertical strip without rejecting 1px tick strokes."""
+    if col is None or len(col) == 0:
+        return 30.0
+    dynamic = float(np.max(col)) * max_factor
+    one_pixel_cap = 255.0 * single_stroke_cap
+    return max(30.0, min(dynamic, one_pixel_cap))
+
+
 def extract_ticks_from_binary(binary: np.ndarray,
                                approx_xs: np.ndarray,
                                min_length_ratio: float = 0.25,
@@ -73,7 +84,7 @@ def extract_ticks_from_binary(binary: np.ndarray,
         col = np.sum(strip, axis=1)
 
         # v6: 列强度阈值收紧到 max*0.40（之前 0.25 太宽松）
-        threshold = max(float(np.max(col)) * 0.40, 30.0)
+        threshold = _tick_row_threshold(col)
         indices = np.where(col > threshold)[0]
 
         if len(indices) < min_len_px // 2:
@@ -149,7 +160,7 @@ def extract_ticks_from_anchor_band(binary: np.ndarray,
 
         strip = binary[:, max(0, x - 3):min(w, x + 4)]
         col = np.sum(strip, axis=1)
-        threshold = max(float(np.max(col)) * 0.40, 30.0)
+        threshold = _tick_row_threshold(col)
         indices = np.where(col > threshold)[0]
         if len(indices) < min_len_px // 2:
             continue

@@ -17,19 +17,7 @@ from .utils import (
     find_peaks_adaptive, extract_ticks_from_binary, draw_projection_plot,
     refine_ticks_by_spacing,
 )
-from .ocr import DigitReader
 from .config import config
-
-
-# 全局 OCR 实例（单例，避免重复加载）
-_ocr_reader: DigitReader = None
-
-
-def get_ocr_reader() -> DigitReader:
-    global _ocr_reader
-    if _ocr_reader is None:
-        _ocr_reader = DigitReader()
-    return _ocr_reader
 
 
 def recognize_main_scale(region: dict,
@@ -103,7 +91,7 @@ def recognize_main_scale(region: dict,
     main_gap = float(np.median(np.diff([t['x'] for t in main_ticks])))
 
     # v6.5: OCR 数字识别已迁移到 merger（在拿到 zero_x 后定向识别）
-    # 这里不再调用 _recognize_main_digits()。但保留 main_digits 字段（空列表）
+    # OCR is handled later in merger after zero_x is known. Keep main_digits empty.
     # 避免 pipeline.py 报错。
     region['main_ticks'] = main_ticks
 
@@ -180,41 +168,24 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
     return binary_crop, x_left, y_top
 
 
-def find_largest_digit_cc(binary_crop: np.ndarray,
-                            x_offset: int, y_offset: int,
-                            zero_x: float = None,
-                            min_area: int = 700,
-                            max_area: int = 1200,
-                            min_aspect: float = 0.6,
-                            max_aspect: float = 3.5) -> tuple:
-    """v6.6: 在备选区二值图中找**最像数字**的连通域。
-
-    数字连通域的特征（v6.5 经验）：
-      - 面积: 700 ~ 1200 px²
-      - 高/宽比: 0.6 ~ 3.5（数字大致 1:1 ~ 1:1.5，但 "1" 窄长）
-      - 位置: 偏向备选区下半（数字底部贴刻度线）
-      - 优先选零线左侧且最靠右的（最近 cm 数字）
-
-    Args:
-        binary_crop: 备选区二值图
-        x_offset, y_offset: 在原图中的偏移
-        zero_x: 零线 x 坐标（用于优先左侧候选）
-        min/max_area, min/max_aspect: 连通域筛选阈值
-
-    Returns:
-        (digit_crop, bbox, confidence) 或 (None, None, 0.0)
-        - digit_crop: 数字 patch 灰度图（裁剪后）
-        - bbox: 数字在原图中的 (x1, y1, x2, y2)
-        - confidence: 0~1 置信度
-    """
+def find_digit_cc_candidates(binary_crop: np.ndarray,
+                             x_offset: int, y_offset: int,
+                             zero_x: float = None,
+                             min_area: int = 700,
+                             max_area: int = 1200,
+                             min_aspect: float = 0.6,
+                             max_aspect: float = 3.5) -> list:
+    """Return all plausible digit connected components in the OCR crop."""
     if binary_crop is None or binary_crop.size == 0:
-        return None, None, 0.0
+        return []
 
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary_crop, connectivity=8)
     if num_labels < 2:
-        return None, None, 0.0
+        return []
 
     H, W = binary_crop.shape
+    dynamic_min_area = max(250, int(H * H * 0.09))
+    effective_min_area = min(min_area, dynamic_min_area)
     candidates = []
     for j in range(1, num_labels):
         x = int(stats[j, cv2.CC_STAT_LEFT])
@@ -222,72 +193,50 @@ def find_largest_digit_cc(binary_crop: np.ndarray,
         w = int(stats[j, cv2.CC_STAT_WIDTH])
         h = int(stats[j, cv2.CC_STAT_HEIGHT])
         area = int(stats[j, cv2.CC_STAT_AREA])
-        if area < min_area or area > max_area:
+        if area < effective_min_area or area > max_area:
             continue
         if w < 3 or h < 5:
             continue
         aspect = h / max(w, 1)
         if aspect < min_aspect or aspect > max_aspect:
             continue
-        # 偏向备选区下半：占比 = (y + h/2) / H
+
         y_center_ratio = (y + h / 2) / H
-        # x 偏向右侧（zero_x 附近）
         x_center_ratio = (x + w / 2) / W
+        confidence = (
+            0.4 * min(1.0, area / 200) +
+            0.3 * (1.0 - abs(aspect - 1.5) / 2.0) +
+            0.3 * y_center_ratio
+        )
+        confidence = max(0.0, min(1.0, confidence))
+
+        pad = 2
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(W, x + w + pad)
+        y2 = min(H, y + h + pad)
+        bbox = (x1 + x_offset, y1 + y_offset, x2 + x_offset, y2 + y_offset)
         candidates.append({
-            'idx': j, 'x': x, 'y': y, 'w': w, 'h': h, 'area': area,
-            'aspect': aspect, 'y_ratio': y_center_ratio, 'x_ratio': x_center_ratio,
+            'idx': j,
+            'x': x,
+            'y': y,
+            'w': w,
+            'h': h,
+            'area': area,
+            'aspect': aspect,
+            'y_ratio': y_center_ratio,
+            'x_ratio': x_center_ratio,
+            'center_x': x + w / 2 + x_offset,
+            'bbox': bbox,
+            'confidence': confidence,
+            'digit_crop': binary_crop[y1:y2, x1:x2],
         })
 
-    if not candidates:
-        return None, None, 0.0
-
-    # 优先级：零线左侧 > 零线右侧；同侧选 x 更大（更靠近零线）
-    candidates.sort(key=lambda c: (
-        (c['x'] + c['w'] / 2 + x_offset) >= zero_x if zero_x is not None else False,
-        -(c['x'] + c['w'] / 2)
-    ))
-    best = candidates[0]
-
-    # 提取 patch（含 padding）
-    pad = 2
-    x1 = max(0, best['x'] - pad)
-    y1 = max(0, best['y'] - pad)
-    x2 = min(W, best['x'] + best['w'] + pad)
-    y2 = min(H, best['y'] + best['h'] + pad)
-    digit_crop = binary_crop[y1:y2, x1:x2]
-
-    # bbox 映射到原图坐标
-    bbox = (x1 + x_offset, y1 + y_offset, x2 + x_offset, y2 + y_offset)
-
-    # confidence
-    confidence = (
-        0.4 * min(1.0, best['area'] / 200) +    # 面积分（~200 px² 是中等数字）
-        0.3 * (1.0 - abs(best['aspect'] - 1.5) / 2.0) +  # 高宽比接近 1.5 最佳
-        0.3 * best['y_ratio']  # 越靠下越好（数字贴刻度线）
-    )
-    confidence = max(0.0, min(1.0, confidence))
-
-    return digit_crop, bbox, confidence
+    return sorted(candidates, key=lambda c: c['center_x'])
 
 
-def _recognize_main_digits(region: dict,
-                            color_region: np.ndarray,
-                            long_tick_xs: List[int],
-                            vproj_norm: np.ndarray = None) -> Tuple[List[DigitInfo], np.ndarray]:
-    """识别主尺上的刻度数字，返回 (digits, debug_vis)"""
-    reader = get_ocr_reader()
-    img = region['image']
-    color_zone = color_region
 
-    digits, debug_vis = reader.read(
-        img, color_zone, long_tick_xs,
-        digit_zone='above',
-        tick_infos=region.get('main_ticks', []),
-        binary=region.get('binary'),
-        vproj_norm=vproj_norm,
-    )
 
-    return digits, debug_vis
 
 
 def _draw_main_ticks(region: dict,

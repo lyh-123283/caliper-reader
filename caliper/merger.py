@@ -17,7 +17,8 @@ def merge_readings(main_result: dict,
                     rotated_color: np.ndarray,
                     region_main: dict,
                     region_vernier: dict,
-                    split_y: int) -> CaliperResult:
+                    split_y: int,
+                    skip_ocr: bool = False) -> CaliperResult:
     """
     合并主尺和游标尺读数，生成最终结果
 
@@ -48,7 +49,8 @@ def merge_readings(main_result: dict,
     # ── 计算主尺整数读数（附带推导诊断信息）──
     main_reading, main_derivation = _compute_main_reading_with_info(
         main_ticks, main_digits, main_gap, zero_x,
-        gray_region=main_gray, binary_region=main_binary)
+        gray_region=main_gray, binary_region=main_binary,
+        skip_ocr=skip_ocr)
 
     # ── 游标对齐索引 ──
     aligned_tick = vernier_result.get('aligned_tick')
@@ -100,6 +102,7 @@ def merge_readings(main_result: dict,
             'main_digits': [(d.text, d.value, d.x) for d in main_digits],
             'main_derivation': main_derivation,
             'derivation_vis': derivation_vis,
+            'skip_ocr': skip_ocr,
         },
     )
 
@@ -144,10 +147,11 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
                                      zero_x: float,
                                      gray_region: np.ndarray = None,
                                      binary_region: np.ndarray = None,
-                                     main_color_region: np.ndarray = None) -> tuple:
+                                     main_color_region: np.ndarray = None,
+                                     skip_ocr: bool = False) -> tuple:
     """计算主尺读数 + 返回推导所需的诊断信息。
 
-    v6.5: 重写为"定向 OCR + 几何 fallback"。
+    v6.5: 重写为"定向 OCR"。
     - 优先用 find_cm_digit_candidates 找 zero_x 左侧 1~2 个 cm 整数刻度
     - 对每个候选 x 调 DigitReader.read_digit_at() 识别数字
     - 选 nearest 数字 + 数 extra_ticks（mm 数）
@@ -158,49 +162,67 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
         (reading, dict):
             nearest_digit: 零线左侧最近的 OCR 数字 (DigitInfo 或 None)
             extra_ticks:   从该数字到零线的额外刻度线数量（mm）
-            strategy:      'ocr' | 'fallback' | 'none'
-            first_tick_x:  几何 fallback 用的第一条主尺刻度线
+            strategy:      'ocr' | 'ocr_failed' | 'skipped'
     """
     if main_gap <= 0:
-        return 0.0, {'nearest_digit': None, 'extra_ticks': 0,
-                       'strategy': 'none', 'first_tick_x': None}
+        return _ocr_failed_reading('invalid_main_gap')
 
-    main_xs = sorted([t['x'] for t in main_ticks]) if main_ticks else []
+    main_xs = _dedupe_main_xs([t['x'] for t in main_ticks], main_gap) if main_ticks else []
+    if skip_ocr:
+        return _ocr_failed_reading('skip_ocr', ocr_engine='skipped', skip_ocr=True)
 
     # ── 策略 1：备选区 + 连通域筛选（v6.6） ──
     if main_xs and zero_x > 0 and gray_region is not None and binary_region is not None:
         from .ocr import get_ocr_reader_singleton
-        from .main_scale import find_nearest_cm_digit_region, find_largest_digit_cc
+        from .main_scale import find_nearest_cm_digit_region, find_digit_cc_candidates
 
         # 1. 框出"zero_x 上方"备选区
         binary_crop, x_off, y_off = find_nearest_cm_digit_region(
             main_ticks, main_gap, zero_x, binary_region)
         if binary_crop is None:
-            return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
+            return _ocr_failed_reading('no_digit_region')
 
         # 2. 在备选区找最像数字的连通域
-        digit_crop, bbox, confidence = find_largest_digit_cc(
-            binary_crop, x_off, y_off, zero_x)
-        if digit_crop is None or confidence < 0.3:
-            return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
+        cc_candidates = find_digit_cc_candidates(binary_crop, x_off, y_off, zero_x)
+        if not cc_candidates:
+            return _ocr_failed_reading('no_digit_component')
 
         # 3. 对 patch 做 OCR
-        digit = get_ocr_reader_singleton().ocr_patch_to_digit(
-            digit_crop, bbox, gray_region)
-        if digit is None or digit.value < 0:
-            return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
+        reader = get_ocr_reader_singleton()
+        engine = reader.engine_status() if hasattr(reader, 'engine_status') else reader.engine_name()
+        ocr_candidates = []
+        for cc in cc_candidates:
+            digit = reader.ocr_patch_to_digit(cc['digit_crop'], cc['bbox'], gray_region)
+            if digit is None or digit.value < 0:
+                continue
+            ref_tick = _bind_digit_to_cm_tick(digit, main_ticks, main_gap)
+            if ref_tick is None:
+                continue
+            ocr_candidates.append({
+                'digit': digit,
+                'value': digit.value,
+                'text': digit.text,
+                'confidence': digit.confidence,
+                'bbox': cc['bbox'],
+                'cc_confidence': cc['confidence'],
+                'center_x': cc['center_x'],
+                'ref_tick_x': float(ref_tick['x']),
+            })
+        if not ocr_candidates:
+            return _ocr_failed_reading('ocr_no_digit', ocr_engine=engine)
 
         # 4. 算 extra_ticks = digit bbox 下沿到 zero_x 之间的主尺刻度线数（mm）
         #    digit.x 是 patch 中心，用最接近的 main_tick 作为 ref
-        ref_x = None
-        best_dist = float('inf')
-        for t in main_ticks:
-            d = abs(t['x'] - digit.x)
-            if d < best_dist:
-                best_dist = d
-                ref_x = float(t['x'])
-        if ref_x is None:
-            ref_x = digit.x
+        side_tol = max(1.5, main_gap * 0.08)
+        usable = [c for c in ocr_candidates if c['ref_tick_x'] <= zero_x + side_tol]
+        if not usable:
+            return _ocr_failed_reading('no_ocr_digit_left_of_zero', ocr_engine=engine)
+        selected = max(
+            usable,
+            key=lambda c: (c['ref_tick_x'], c['confidence'], c['cc_confidence'])
+        )
+        digit = selected['digit']
+        ref_x = selected['ref_tick_x']
         extra_ticks = sum(1 for x in main_xs if ref_x + main_gap * 0.3 < x <= zero_x)
         # 5. 读数 = digit.value × 10（cm → mm）+ extra_ticks
         reading = float(digit.value) * 10 + extra_ticks
@@ -208,65 +230,109 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
             'nearest_digit': digit,
             'extra_ticks': extra_ticks,
             'strategy': 'ocr',
-            'first_tick_x': None,
             'ref_tick_x': ref_x,
+            'ocr_text': digit.text,
+            'ocr_confidence': digit.confidence,
+            'ocr_engine': engine,
+            'ocr_candidates': _summarize_ocr_candidates(ocr_candidates, selected),
         }
 
     # ── 策略 2/3：纯几何回退（OCR 路径无结果时） ──
-    return _fallback_reading(main_xs, main_gap, zero_x, main_ticks)
+    return _ocr_failed_reading('missing_ocr_inputs')
 
 
-def _fallback_reading(main_xs: list, main_gap: float, zero_x: float,
-                      main_ticks: list) -> tuple:
-    """v6.6: 几何回退法——OCR 路径失败时使用。
-    找到第一条"正常"主尺刻度（跳过 DELIXI 伪刻），用几何距离算主尺读数。
-    """
-    if not main_xs or len(main_xs) < 2:
-        return 0.0, {'nearest_digit': None, 'extra_ticks': 0,
-                       'strategy': 'none', 'first_tick_x': None}
-    first_tick_x = _find_first_regular_tick(main_xs, main_gap)
-    if zero_x >= first_tick_x:
-        extra_ticks = int(round((zero_x - first_tick_x) / main_gap))
-        extra_ticks = max(0, extra_ticks)
-        return float(extra_ticks), {
-            'nearest_digit': None,
-            'extra_ticks': extra_ticks,
-            'strategy': 'fallback',
-            'first_tick_x': first_tick_x,
-        }
-    return 0.0, {'nearest_digit': None, 'extra_ticks': 0,
-                  'strategy': 'none', 'first_tick_x': None}
+def _ocr_failed_reading(reason: str,
+                        ocr_engine: str = None,
+                        skip_ocr: bool = False) -> tuple:
+    strategy = 'skipped' if skip_ocr else 'ocr_failed'
+    return 0.0, {
+        'nearest_digit': None,
+        'extra_ticks': 0,
+        'strategy': strategy,
+        'ocr_reason': reason,
+        'ocr_engine': ocr_engine,
+        'skip_ocr': skip_ocr,
+    }
 
 
-def _find_first_regular_tick(main_xs: List[int], main_gap: float) -> int:
-    """
-    找主尺第一条"正常"刻度线，跳过 DELIXI Logo 等伪刻线。
+def _bind_digit_to_cm_tick(digit: DigitInfo,
+                           main_ticks: List[dict],
+                           main_gap: float) -> dict:
+    """Bind an OCR digit to the nearest centimeter-length main-scale tick."""
+    if digit is None or not main_ticks or main_gap <= 0:
+        return None
+    cm_ticks = _main_cm_ticks(main_ticks, main_gap)
+    if not cm_ticks:
+        return None
+    center_x = float(digit.x)
+    nearest = min(cm_ticks, key=lambda t: abs(float(t['x']) - center_x))
+    if abs(float(nearest['x']) - center_x) > max(8.0, main_gap * 0.65):
+        return None
+    return nearest
 
-    伪刻线特征：
-      - 与下一条刻度的间距远小于 main_gap（DELIXI Logo 字母边缘的细碎峰）
-      - 与下一条刻度的间距远大于 main_gap（孤立伪刻）
 
-    正常起点：相邻 gap ∈ [0.5×main_gap, 2.0×main_gap] 的第一条。
+def _main_cm_ticks(main_ticks: List[dict], main_gap: float) -> List[dict]:
+    """Return deduped long ticks, which correspond to centimeter marks."""
+    if not main_ticks:
+        return []
+    long_ticks = [t for t in main_ticks if t.get('is_long')]
+    if not long_ticks:
+        lengths = [float(t.get('length', 0)) for t in main_ticks]
+        if not lengths:
+            return []
+        median_len = float(np.median(lengths))
+        long_ticks = [t for t in main_ticks if float(t.get('length', 0)) >= median_len * 1.18]
+    if not long_ticks:
+        return []
 
-    Args:
-        main_xs:  已排序的主尺刻度 x 坐标
-        main_gap: 估算的主尺刻度间距
+    tol = max(3.0, main_gap * 0.25)
+    groups = []
+    for tick in sorted(long_ticks, key=lambda t: float(t['x'])):
+        if not groups or float(tick['x']) - float(groups[-1][-1]['x']) > tol:
+            groups.append([tick])
+        else:
+            groups[-1].append(tick)
 
-    Returns:
-        第一条正常刻度的 x 坐标
-    """
-    if not main_xs:
-        return 0
-    if len(main_xs) < 2:
-        return int(main_xs[0])
-    lo_th = main_gap * 0.5
-    hi_th = main_gap * 2.0
-    # 从前往后扫，找第一个"相邻间距在合理范围"的位置
-    for i in range(len(main_xs) - 1):
-        d = main_xs[i + 1] - main_xs[i]
-        if lo_th <= d <= hi_th:
-            return int(main_xs[i])
-    return int(main_xs[0])
+    deduped = []
+    for group in groups:
+        deduped.append(max(group, key=lambda t: float(t.get('length', 0))))
+    return deduped
+
+
+def _dedupe_main_xs(xs: list, main_gap: float) -> list:
+    """Deduplicate nearby main-scale tick x positions before counting mm ticks."""
+    if not xs:
+        return []
+    tol = max(2.0, main_gap * 0.25) if main_gap and main_gap > 0 else 3.0
+    groups = []
+    for x in sorted(float(v) for v in xs):
+        if not groups or x - groups[-1][-1] > tol:
+            groups.append([x])
+        else:
+            groups[-1].append(x)
+    return [float(np.median(group)) for group in groups]
+
+
+def _summarize_ocr_candidates(candidates: list, selected: dict = None) -> list:
+    selected_ref = selected.get('ref_tick_x') if selected else None
+    out = []
+    for c in candidates:
+        ref_tick_x = c.get('ref_tick_x')
+        out.append({
+            'text': c.get('text'),
+            'value': c.get('value'),
+            'confidence': c.get('confidence'),
+            'bbox': c.get('bbox'),
+            'center_x': c.get('center_x'),
+            'ref_tick_x': ref_tick_x,
+            'selected': selected_ref is not None and ref_tick_x is not None
+                        and abs(ref_tick_x - selected_ref) < 1e-6,
+        })
+    return out
+
+
+
+
 
 
 # ═══════════════════════════ 最终标注 ═══════════════════════════
@@ -372,15 +438,6 @@ def draw_final_annotation(rotated_color: np.ndarray,
         # 公式（顶部居中，深色半透明底条）
         formula_text = f"MAIN = {nd.value} + {extra} = {main_reading:.1f} mm"
         _draw_top_banner(ann, formula_text, (40, 160, 40))
-
-    elif main_derivation and main_derivation.get('strategy') == 'fallback':
-        first_x = main_derivation.get('first_tick_x')
-        extra = main_derivation.get('extra_ticks', 0)
-        if first_x is not None:
-            fx = int(first_x)
-            cv2.line(ann, (fx, 0), (fx, split_y), (200, 200, 40), 2, cv2.LINE_AA)
-        formula_text = f"MAIN = 0 + {extra} = {main_reading:.1f} mm  (fallback)"
-        _draw_top_banner(ann, formula_text, (180, 160, 30))
 
     # ═══════════════════════════════════════════
     #  游标读数推导标注 (增强版)
@@ -575,16 +632,6 @@ def draw_reading_derivation(rotated_color: np.ndarray,
         _draw_top_banner(roi_main,
                          f"MAIN = {nd.value} + {extra} = {main_reading:.1f} mm",
                          (40, 180, 60))
-
-    elif main_derivation and main_derivation.get('strategy') == 'fallback':
-        extra = main_derivation.get('extra_ticks', 0)
-        fx = main_derivation.get('first_tick_x')
-        if fx is not None:
-            fix = int(fx)
-            cv2.line(roi_main, (fix, 0), (fix, main_h), (200, 200, 40), 2, cv2.LINE_AA)
-        _draw_top_banner(roi_main,
-                         f"MAIN = 0 + {extra} = {main_reading:.1f} mm (fallback)",
-                         (180, 160, 30))
 
     # ═══ 2. 游标推导 ═══
     vy_off = region_vernier.get('y_offset', split_y)

@@ -63,6 +63,7 @@ class CaliperApp:
         self._is_processing = False
         self._latest_file_path = ""
         self._auto_follow_progress = True
+        self.skip_ocr_var = tk.BooleanVar(value=False)
 
         # 动态标签页
         self.tab_widgets = {}
@@ -137,6 +138,21 @@ class CaliperApp:
             command=self._open_image
         )
         self.btn_open.pack(fill=tk.X, pady=(0, 10))
+
+        self.chk_skip_ocr = tk.Checkbutton(
+            inner,
+            text="跳过 OCR（算法调试）",
+            variable=self.skip_ocr_var,
+            font=('Microsoft YaHei', 9),
+            bg=self.card_color,
+            fg="#a6adc8",
+            activebackground=self.card_color,
+            activeforeground=self.fg_color,
+            selectcolor=self.bg_color,
+            anchor=tk.W,
+            cursor="hand2",
+        )
+        self.chk_skip_ocr.pack(fill=tk.X, pady=(0, 8))
 
         # 结果展示区
         tk.Label(
@@ -397,17 +413,6 @@ class CaliperApp:
         if reset and self.tab_keys:
             self._switch_tab(self.tab_keys[0])
 
-    def _refresh_dynamic_tabs(self, select_tab: str = None):
-        """Rebuild tabs while keeping the current selection when possible."""
-        previous_tab = self.current_tab
-        self._build_dynamic_tabs(
-            self.current_result.debug_images if self.current_result else {},
-            reset=False,
-        )
-        target = select_tab or previous_tab
-        if target in self.tab_widgets:
-            self._switch_tab(target)
-
     def _make_pending_result(self) -> CaliperResult:
         """Create a temporary result object while the pipeline is still running."""
         return CaliperResult(
@@ -481,9 +486,12 @@ class CaliperApp:
         self._is_processing = True
         self._latest_file_path = file_path
         self._auto_follow_progress = True
+        skip_ocr = bool(self.skip_ocr_var.get())
         self.btn_open.config(state=tk.DISABLED)
+        self.chk_skip_ocr.config(state=tk.DISABLED)
         self.btn_save.config(state=tk.DISABLED, bg="#45475a", fg=self.fg_color)
-        self.status_label.config(text=f"⏳ 正在识别: {os.path.basename(file_path)} ...")
+        mode_text = "（跳过 OCR）" if skip_ocr else ""
+        self.status_label.config(text=f"⏳ 正在识别{mode_text}: {os.path.basename(file_path)} ...")
         self.root.update_idletasks()
 
         def worker():
@@ -500,6 +508,7 @@ class CaliperApp:
                     )
 
                 self.root.after(0, lambda: self._on_image_loaded_for_progress(img))
+                self.pipeline.set_skip_ocr(skip_ocr)
                 result = self.pipeline.run(img, progress_callback=progress)
                 self.root.after(0, lambda: self._on_image_processed(img, result, file_path))
             except Exception as e:
@@ -522,6 +531,7 @@ class CaliperApp:
 
         self.btn_save.config(state=tk.NORMAL, bg=self.accent_color, fg="#1e1e2e")
         self.btn_open.config(state=tk.NORMAL)
+        self.chk_skip_ocr.config(state=tk.NORMAL)
         self._is_processing = False
 
         self.status_label.config(
@@ -535,6 +545,7 @@ class CaliperApp:
         traceback.print_exc()
         messagebox.showerror("识别错误", f"识别过程中出现错误:\n{str(error)}")
         self.btn_open.config(state=tk.NORMAL)
+        self.chk_skip_ocr.config(state=tk.NORMAL)
         self._is_processing = False
         self.status_label.config(text="❌ 识别失败")
 
@@ -556,10 +567,15 @@ class CaliperApp:
         else:
             self.lbl_total.config(fg="#f38ba8")
 
+        extra = result.extra_info
+        if isinstance(extra, dict) and extra.get('skip_ocr'):
+            self.lbl_ocr_engine.config(text="OCR: skipped (算法调试)", fg=self.warn_color)
+            self.lbl_ocr_result.config(text="OCR: --  (skipped)")
+            return
+
         # ── OCR 引擎状态 ──
-        from caliper.ocr import DigitReader
-        from caliper.main_scale import get_ocr_reader
-        reader = get_ocr_reader()
+        from caliper.ocr import get_ocr_reader_singleton
+        reader = get_ocr_reader_singleton()
         status = reader.engine_status() if hasattr(reader, 'engine_status') else reader.engine_name()
         if 'fallback' in status.lower() or '无' in status:
             self.lbl_ocr_engine.config(text=f"OCR: {status}", fg="#f38ba8")
@@ -570,7 +586,6 @@ class CaliperApp:
         else:
             self.lbl_ocr_engine.config(text=f"OCR: {status}", fg="#a6adc8")
 
-        extra = result.extra_info
         deriv = extra.get('main_derivation', {}) if isinstance(extra, dict) else {}
         ocr_text = deriv.get('ocr_text') if isinstance(deriv, dict) else None
         ocr_conf = deriv.get('ocr_confidence') if isinstance(deriv, dict) else None
@@ -733,10 +748,6 @@ class CaliperApp:
         self._zoom_fit_mode = False
         self._zoom_level = 1.0
         self._render_image()
-
-    def _display_image_with_overlay(self, img: np.ndarray):
-        """兼容旧接口"""
-        self._display_image(img)
 
     def _save_result(self):
         """保存标注结果图像"""

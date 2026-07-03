@@ -18,7 +18,8 @@ from .preprocess import preprocess
 from .roi_extract import extract_roi, orient_caliper
 from .region_split import split_scales
 from .main_scale import recognize_main_scale
-from .vernier_scale import recognize_vernier_scale, find_best_alignment
+from .vernier_scale import recognize_vernier_scale
+from .vernier_rectify import rectify_vernier_region
 from .merger import merge_readings
 from .utils import draw_legend_below, draw_projection_plot
 from .config import config
@@ -30,7 +31,7 @@ class CaliperPipeline:
     def __init__(self):
         self.debug_images = {}
         self.step_results = {}
-        self._override_precision = None  # 用户手动指定的精度，None=自动推断
+        self._skip_ocr = False
 
         # ── 预处理参数（可通过 config.preprocess.xxx 修改）──
         self.preprocess_params = {
@@ -41,9 +42,16 @@ class CaliperPipeline:
             'median_ksize': config.preprocess.median_ksize,
         }
 
-    def set_precision_override(self, precision: float = None):
-        """设置手动精度覆盖。None 表示自动推断。"""
-        self._override_precision = precision
+    def set_skip_ocr(self, skip: bool = False):
+        """Enable fast algorithm-debug mode by bypassing OCR work."""
+        self._skip_ocr = bool(skip)
+
+    def _emit_progress(self, progress_callback, step_key: str, status: str):
+        if progress_callback is None:
+            return
+        image = self.debug_images.get(step_key)
+        if image is not None:
+            progress_callback(step_key, image, status)
 
     def run(self, img: np.ndarray, progress_callback=None) -> CaliperResult:
         """
@@ -65,6 +73,7 @@ class CaliperPipeline:
         pp = preprocess(img, **self.preprocess_params)
         self.debug_images['0_预处理'] = pp['debug_vis']
         self.step_results['preprocess'] = pp
+        self._emit_progress(progress_callback, '0_预处理', '预处理完成')
 
         # ═══════════════════════════════════════
         #  步骤 1: ROI提取 + 方向矫正
@@ -78,8 +87,9 @@ class CaliperPipeline:
         if roi_result['roi_color'] is None:
             return self._fail(original, "ROI 提取失败")
 
-        self.debug_images['1a_ROI提取'] = roi_result['mask_vis']
+        self.debug_images['1a_ROI提取'] = roi_result['roi_color']
         self.step_results['roi'] = roi_result
+        self._emit_progress(progress_callback, '1a_ROI提取', 'ROI 提取完成')
 
         # 1b. 方向矫正
         orient_result = orient_caliper(
@@ -89,53 +99,13 @@ class CaliperPipeline:
         )
         self.debug_images['1b_方向矫正'] = orient_result['orient_vis']
         self.step_results['orient'] = orient_result
-        return self._run_remainder(original, orient_result)
-
-    def run_from_crop(self, img: np.ndarray,
-                       x1: int, y1: int, x2: int, y2: int) -> CaliperResult:
-        """
-        执行流水线，但使用手动指定的 ROI 矩形而非自动检测。
-
-        Args:
-            img:   BGR 彩色图像 (原图)
-            x1, y1, x2, y2: 手动框选的刻度区域矩形坐标（原图坐标系）
-        """
-        self.debug_images = {}
-        self.step_results = {}
-        original = img.copy()
-
-        # ── 步骤 0: 预处理（在全图上做，保证质量）──
-        pp = preprocess(img, **self.preprocess_params)
-        self.debug_images['0_预处理'] = pp['debug_vis']
-        self.step_results['preprocess'] = pp
-
-        # ── 手动裁剪 ──
-        x1c = max(0, min(x1, x2))
-        x2c = min(img.shape[1], max(x1, x2))
-        y1c = max(0, min(y1, y2))
-        y2c = min(img.shape[0], max(y1, y2))
-
-        # 校验裁剪区域有效性
-        if x2c - x1c < 20 or y2c - y1c < 20:
-            return self._fail(original, "手动框选区域过小（需至少 20×20 像素）")
-
-        roi_color = img[y1c:y2c + 1, x1c:x2c + 1]
-        roi_gray = pp['enhanced'][y1c:y2c + 1, x1c:x2c + 1]
-        roi_binary = pp['binary_adaptive'][y1c:y2c + 1, x1c:x2c + 1]
-
-        # 手动 ROI 可视化
-        roi_vis = self._make_manual_roi_vis(original, x1c, y1c, x2c, y2c, roi_color)
-        self.debug_images['1a_ROI手动框选'] = roi_vis
-
-        # ── 1b. 方向矫正 ──
-        orient_result = orient_caliper(roi_color, roi_gray, roi_binary)
-        self.debug_images['1b_方向矫正'] = orient_result['orient_vis']
-        self.step_results['orient'] = orient_result
-        return self._run_remainder(original, orient_result)
+        self._emit_progress(progress_callback, '1b_方向矫正', '方向矫正完成')
+        return self._run_remainder(original, orient_result, progress_callback)
 
     def _run_remainder(self, original: np.ndarray,
-                        orient_result: dict) -> CaliperResult:
-        """执行流水线剩余部分（步骤 2~5），供 run 和 run_from_crop 共用"""
+                       orient_result: dict,
+                       progress_callback=None) -> CaliperResult:
+        """执行流水线剩余部分（步骤 2~5）。"""
         rotated_color = orient_result['rotated_color']
         rotated_gray = orient_result['rotated_gray']
         rotated_binary = orient_result['rotated_binary']
@@ -144,6 +114,7 @@ class CaliperPipeline:
         split_result = split_scales(rotated_gray, rotated_binary, rotated_color)
         self.debug_images['2_区域分离'] = split_result['split_vis']
         self.step_results['split'] = split_result
+        self._emit_progress(progress_callback, '2_区域分离', '区域分离完成')
         region_main = split_result['region_main']
         region_vernier = split_result['region_vernier']
         split_y = split_result['split_y']
@@ -154,38 +125,33 @@ class CaliperPipeline:
         self.debug_images['3a_主尺刻度线'] = main_result['vis_ticks']
         self.debug_images['3b_主尺数字OCR'] = main_result['vis_digits']
         self.step_results['main'] = main_result
+        self._emit_progress(progress_callback, '3a_主尺刻度线', '主尺刻线识别完成')
 
         # 步骤 4
         vernier_color = rotated_color[split_y:, :]
+        vernier_rectify = rectify_vernier_region(region_vernier, vernier_color)
+        self.step_results['vernier_rectify'] = vernier_rectify
+        region_vernier = vernier_rectify['region']
+        vernier_color = vernier_rectify['color']
         vernier_result = recognize_vernier_scale(
             region_vernier, main_result['main_gap'], vernier_color,
             main_result['main_ticks']
         )
-        # 精度覆盖
-        if self._override_precision is not None:
-            vernier_result['precision'] = self._override_precision
-            # 精度改了需要重算对齐
-            vernier_result['vernier_reading'], _, vernier_result['alignment_confidence'] = \
-                find_best_alignment(
-                    vernier_result['vernier_ticks'],
-                    main_result['main_gap'],
-                    self._override_precision,
-                    vernier_result['zero_x'],
-                    main_result['main_ticks']
-                )
-
         # ── 生成零线验证概览 ──
         overview = _make_zero_overview(rotated_color, main_result, vernier_result,
                                         split_y, region_main, region_vernier)
         self.debug_images['3a_主尺刻度线'] = overview
+        self._emit_progress(progress_callback, '3a_主尺刻度线', '零线总览完成')
         self.debug_images['3b_主尺数字OCR'] = main_result['vis_digits']
-        self.debug_images['4a_游标刻度线'] = vernier_result['vis_ticks']
+        self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
+        self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
         # ── 对齐可视化：用整张 ROI 图（含主尺真实网格）──
         vernier_result['vis_alignment'] = _regenerate_alignment_vis(
             vernier_result, vernier_color, rotated_color,
             split_y, main_result['main_ticks'], main_result['main_gap'])
-        self.debug_images['4b_游标对齐'] = vernier_result['vis_alignment']
+        self.debug_images['4c_游标对齐'] = vernier_result['vis_alignment']
         self.step_results['vernier'] = vernier_result
+        self._emit_progress(progress_callback, '4c_游标对齐', '游标对齐完成')
 
         # ── 添加图例（在对齐图重新生成之后）──
         _add_legends(main_result, vernier_result)
@@ -193,39 +159,29 @@ class CaliperPipeline:
         # 步骤 5
         final = merge_readings(
             main_result, vernier_result,
-            rotated_color, region_main, region_vernier, split_y
+            rotated_color, region_main, region_vernier, split_y,
+            skip_ocr=self._skip_ocr
         )
 
         # ── 生成 OCR 调试图（替换空白占位）──
-        ocr_debug_vis = _make_ocr_debug_vis(
-            rotated_color, split_y, region_main,
-            main_result, vernier_result, final)
-        if ocr_debug_vis is not None:
-            self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
+        if not self._skip_ocr:
+            ocr_debug_vis = _make_ocr_debug_vis(
+                rotated_color, split_y, region_main,
+                main_result, vernier_result, final)
+            if ocr_debug_vis is not None:
+                self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
+                self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
 
         final.debug_images = self.debug_images
         self.debug_images['5_最终标注'] = final.image_annotated
+        self._emit_progress(progress_callback, '5_最终标注', '最终标注完成')
         # 添加读数推导可视化
         deriv_vis = final.extra_info.get('derivation_vis')
         if deriv_vis is not None:
             self.debug_images['5b_读数推导'] = deriv_vis
+            self._emit_progress(progress_callback, '5b_读数推导', '读数推导完成')
 
         return final
-
-    def _make_manual_roi_vis(self, original, x1, y1, x2, y2, roi_cropped):
-        """手动 ROI 可视化：原图+矩形框 + 裁剪结果"""
-        left = original.copy()
-        cv2.rectangle(left, (x1, y1), (x2, y2), (0, 255, 200), 2)
-        cv2.putText(left, "Manual ROI", (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 200), 1)
-        from .utils import make_comparison_vis
-        vis = make_comparison_vis(left, roi_cropped,
-                                   "Original + Manual Box",
-                                   "Cropped ROI")
-        h = vis.shape[0]
-        cv2.putText(vis, "STEP 1a: Manual ROI Selection",
-                    (5, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 125), 1)
-        return vis
 
     def _fail(self, img: np.ndarray, reason: str) -> CaliperResult:
         """生成失败结果"""
@@ -305,8 +261,7 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
        中: 备选区裁出 blow up
        下: 连通域筛选 + OCR 结果
     """
-    from .main_scale import find_nearest_cm_digit_region, find_largest_digit_cc
-    from .ocr import get_ocr_reader_singleton
+    from .main_scale import find_nearest_cm_digit_region
 
     main_color = rotated_color[:split_y, :]
     main_gray = region_main.get('image')
@@ -334,21 +289,29 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     ch, cw = binary_crop.shape
 
     # ── 2. 连通域筛选 ──
-    digit_crop, sel_bbox, cc_conf = find_largest_digit_cc(
-        binary_crop, x_off, y_off, zero_x)
 
     # ── 3. OCR ──
-    reader = get_ocr_reader_singleton()
-    eng = reader.engine_status()
-    digit = None
-    ocr_text = ""
-    if digit_crop is not None and sel_bbox is not None:
-        digit = reader.ocr_patch_to_digit(digit_crop, sel_bbox, main_gray)
 
     # ── 4. 策略信息（从 final_result 取）──
     extra = final_result.extra_info if final_result else {}
     main_deriv = extra.get('main_derivation', {}) if hasattr(final_result, 'extra_info') else {}
     strategy = main_deriv.get('strategy', '?') if isinstance(main_deriv, dict) else '?'
+    eng = main_deriv.get('ocr_engine', '?') if isinstance(main_deriv, dict) else '?'
+    ocr_candidates = main_deriv.get('ocr_candidates', []) if isinstance(main_deriv, dict) else []
+    selected_candidates = [c for c in ocr_candidates if c.get('selected')]
+    sel_bbox = selected_candidates[0].get('bbox') if selected_candidates else None
+    if selected_candidates:
+        selected = selected_candidates[0]
+        ocr_line = "OCR => '{}' ref_x={}".format(
+            selected.get('text'), int(round(float(selected.get('ref_tick_x', 0))))
+        )
+        ocr_color = (0, 255, 100)
+    elif ocr_candidates:
+        ocr_line = "OCR candidates found, none selected"
+        ocr_color = (0, 160, 255)
+    else:
+        ocr_line = "OCR => no candidate"
+        ocr_color = (100, 100, 255)
 
     # ═══════════════════════════════════
     #  Panel A: 主尺彩色 + 红框 + 零线
@@ -411,16 +374,6 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         cv2.rectangle(panel_c, (bx1, by1), (bx2, by2), (0, 255, 100), 3)
 
     # OCR 结果文字
-    if digit is not None and digit.value >= 0:
-        ocr_line = f"OCR => '{digit.value}' (conf={digit.confidence:.2f})"
-        ocr_color = (0, 255, 100)
-    elif digit_crop is not None:
-        ocr_line = f"OCR => FAILED (no digit read)"
-        ocr_color = (0, 160, 255)
-    else:
-        ocr_line = "NO CC selected"
-        ocr_color = (100, 100, 255)
-
     # ═══════════════════════════════════
     #  纵向拼接三面板
     # ═══════════════════════════════════

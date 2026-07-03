@@ -202,8 +202,8 @@ class RegionSplitConfig:
 # ═════════════════════════════════════════════════════════════
 #  3. 主尺识别 — main_scale.py
 # ═════════════════════════════════════════════════════════════
-
 class MainScaleConfig:
+
     """主尺识别参数：自适应阈值 → 垂直投影 → 峰值检测 → 刻线提取 → 等间距补全 → OCR"""
 
     # ── 二值化（自适应阈值）──
@@ -218,7 +218,6 @@ class MainScaleConfig:
     #     find_peaks_adaptive 的 threshold_factor（越小越敏感）
     #     v6: 提高到 0.20（之前 0.12 太敏感，把噪声峰也算入）
     peak_threshold_factor: float = 0.20
-
     # ── 最小刻线数 ──
     min_tick_count: int = 3
 
@@ -244,7 +243,7 @@ class MainScaleConfig:
 # ═════════════════════════════════════════════════════════════
 
 class VernierScaleConfig:
-    """游标尺识别参数：自适应阈值 → 投影 → 精度推断 → 零线 → 等间距补全 → 对齐"""
+    """Vernier recognition params: projection -> fixed 0.02mm -> zero -> spacing fill -> alignment."""
 
     # ── 二值化（自适应阈值）──
     #     blockSize: 局部邻域大小（奇数）
@@ -260,11 +259,6 @@ class VernierScaleConfig:
     # ── 最小刻线数 ──
     min_tick_count: int = 3
 
-    # ── 精度推断 — 刻线数阈值 ──
-    #      直接数游标尺刻线条数：>= 40 → 0.02, >= 15 → 0.05, >= 5 → 0.1
-    precision_tick_50: int = 40
-    precision_tick_20: int = 15
-    precision_tick_10: int = 5
 
     # ── 零线验证 ──
     #     候选零线刻线长度需 >= median_len * factor

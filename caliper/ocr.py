@@ -512,7 +512,7 @@ class DigitReader:
                               gray_region: np.ndarray = None) -> 'DigitInfo':
         """v6.6: 接收已选定的数字 patch + bbox，OCR 后返回 DigitInfo。
 
-        适用于上游（main_scale.find_largest_digit_cc）已经通过连通域分析
+        适用于上游已经通过连通域分析
         选定了数字位置+裁剪好 patch 的场景。
 
         Args:
@@ -526,18 +526,24 @@ class DigitReader:
         if patch is None or patch.size == 0:
             return None
         self._ensure_engine()
+        patch_variants = [patch.copy()]
+        if len(patch.shape) == 2:
+            patch_variants.append(cv2.bitwise_not(patch))
         if gray_region is not None and bbox is not None:
             x1, y1, x2, y2 = bbox
             x1 = max(0, min(x1, gray_region.shape[1] - 1))
             x2 = max(0, min(x2, gray_region.shape[1]))
             y1 = max(0, min(y1, gray_region.shape[0] - 1))
             y2 = max(0, min(y2, gray_region.shape[0]))
-            patch = gray_region[y1:y2, x1:x2]
-            if patch.size == 0:
-                return None
+            gray_patch = gray_region[y1:y2, x1:x2]
+            if gray_patch.size > 0:
+                patch_variants.append(self._enhance_patch(gray_patch))
 
-        enhanced = self._enhance_patch(patch)
-        results = self._ocr_single_patch(enhanced)
+        results = []
+        for candidate_patch in patch_variants:
+            results = self._ocr_single_patch(candidate_patch)
+            if results:
+                break
         for text, conf in results:
             if not text.isdigit():
                 continue
@@ -687,4 +693,3 @@ def get_ocr_reader_singleton() -> 'DigitReader':
     if _OCR_READER_SINGLETON is None:
         _OCR_READER_SINGLETON = DigitReader()
     return _OCR_READER_SINGLETON
-

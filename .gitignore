@@ -13,6 +13,7 @@ env/
 
 # 调试输出目录
 _debug_out/
+debug_*.png
 
 # 参数测试相关
 param_search_results/

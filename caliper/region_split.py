@@ -35,9 +35,9 @@ def split_scales(rotated_gray: np.ndarray,
     else:
         binary = rotated_binary
 
-    # Prefer the top of the vernier tick row.  The visual boundary between
-    # the two metal parts is often at the bottom of those ticks; cutting
-    # there removes the very marks the next stage needs.
+    # Use the physical seam itself as the split.  Downstream recognition should
+    # work from the true main/vernier boundary instead of an artificially
+    # shifted crop line.
     split_y = _split_by_vernier_tick_band(rotated_gray, binary, h, w)
     if split_y is None:
         split_y = _split_by_candidate_scan(rotated_gray, binary, h, w)
@@ -81,7 +81,7 @@ def split_scales(rotated_gray: np.ndarray,
 def _split_by_vernier_tick_band(gray: np.ndarray, binary: np.ndarray,
                                 h: int, w: int):
     """用中心区域梯度最大处定位分界线。"""
-    lo, hi = int(h * 0.42), int(h * 0.70)
+    lo, hi = int(h * 0.42), int(h * 0.84)
     if hi <= lo:
         return None
 
@@ -106,8 +106,7 @@ def _split_by_vernier_tick_band(gray: np.ndarray, binary: np.ndarray,
     if float(grad[best_y]) < 2.0:
         return None
 
-    split_y = max(int(h * config.region_split.search_lo_ratio), best_y - max(8, h // 55))
-    return _snap_split_to_min_gradient(gray, split_y, lo, hi)
+    return best_y
 
 
 def _split_by_candidate_scan(gray: np.ndarray, binary: np.ndarray,
@@ -176,27 +175,6 @@ def _snap_to_brightest_gap(gray: np.ndarray, center_y: int, band: int,
     return win_lo + int(np.argmax(row_means))
 
 
-def _snap_split_to_min_gradient(gray: np.ndarray, split_y: int, lo: int, hi: int) -> int:
-    """Nudge the split to the local minimum gradient near the candidate edge."""
-    half = 4
-    y1 = max(lo, split_y - half)
-    y2 = min(hi, split_y + half)
-    if y2 <= y1:
-        return split_y
-
-    x1, x2 = int(gray.shape[1] * 0.28), int(gray.shape[1] * 0.70)
-    if x2 <= x1:
-        x1, x2 = 0, gray.shape[1]
-
-    band = gray[y1:y2 + 1, x1:x2]
-    if band.size == 0:
-        return split_y
-
-    means = np.mean(band, axis=1).astype(float)
-    grads = np.abs(np.gradient(means))
-    return y1 + int(np.argmin(grads))
-
-
 def _equispaced_coverage(zone_binary: np.ndarray, w: int):
     """
     估算一个 y 带内的"等间距连续刻线段跨度 / ROI 宽度" + 估算的 tick_gap。
@@ -262,30 +240,6 @@ def _equispaced_coverage(zone_binary: np.ndarray, w: int):
     if len(seg_diffs_valid) >= 2:
         tick_gap = float(np.median(seg_diffs_valid))
     return min(1.0, span / float(w)), tick_gap
-
-
-def _extract_vertical_feature_positions(binary: np.ndarray, w: int) -> np.ndarray:
-    """从二值图提取有垂直刻线特征的 x 坐标列表"""
-    vproj = np.sum(binary, axis=0).astype(float)
-    if np.max(vproj) > 0:
-        vproj /= np.max(vproj)
-    # 找局部峰值（垂直刻线位置），低门槛确保不遗漏
-    from .utils import find_peaks_adaptive
-    return find_peaks_adaptive(vproj, min_dist=2, threshold_factor=0.1)
-
-
-def _find_local_peaks(signal: np.ndarray, min_dist: int = 5,
-                       threshold: float = 0.02) -> list:
-    """在 1D 信号中找局部峰值，返回索引列表"""
-    n = len(signal)
-    peaks = []
-    for i in range(min_dist, n - min_dist):
-        if signal[i] <= threshold:
-            continue
-        if all(signal[i] > signal[j]
-               for j in range(i - min_dist, i + min_dist + 1) if j != i):
-            peaks.append(i)
-    return peaks
 
 
 # ═══════════════════════════════════════════════════════════
