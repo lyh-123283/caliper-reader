@@ -31,7 +31,6 @@ class CaliperPipeline:
     def __init__(self):
         self.debug_images = {}
         self.step_results = {}
-        self._skip_ocr = False
 
         # ── 预处理参数（可通过 config.preprocess.xxx 修改）──
         self.preprocess_params = {
@@ -41,10 +40,6 @@ class CaliperPipeline:
             'gamma': config.preprocess.gamma,
             'median_ksize': config.preprocess.median_ksize,
         }
-
-    def set_skip_ocr(self, skip: bool = False):
-        """Enable fast algorithm-debug mode by bypassing OCR work."""
-        self._skip_ocr = bool(skip)
 
     def _emit_progress(self, progress_callback, step_key: str, status: str):
         if progress_callback is None:
@@ -81,8 +76,10 @@ class CaliperPipeline:
         # 1a. ROI 提取（投影法，利用 enhanced 做灰度、binary 做投影定位）
         roi_result = extract_roi(
             pp['color'],
-            pp['binary_adaptive'],
-            pp['enhanced']
+            pp.get('roi_binary', pp['binary_adaptive']),
+            pp.get('roi_enhanced', pp['enhanced']),
+            crop_gray=pp['enhanced'],
+            crop_binary=pp['binary_adaptive'],
         )
         if roi_result['roi_color'] is None:
             return self._fail(original, "ROI 提取失败")
@@ -159,18 +156,16 @@ class CaliperPipeline:
         # 步骤 5
         final = merge_readings(
             main_result, vernier_result,
-            rotated_color, region_main, region_vernier, split_y,
-            skip_ocr=self._skip_ocr
+            rotated_color, region_main, region_vernier, split_y
         )
 
         # ── 生成 OCR 调试图（替换空白占位）──
-        if not self._skip_ocr:
-            ocr_debug_vis = _make_ocr_debug_vis(
-                rotated_color, split_y, region_main,
-                main_result, vernier_result, final)
-            if ocr_debug_vis is not None:
-                self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
-                self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
+        ocr_debug_vis = _make_ocr_debug_vis(
+            rotated_color, split_y, region_main,
+            main_result, vernier_result, final)
+        if ocr_debug_vis is not None:
+            self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
+            self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
 
         final.debug_images = self.debug_images
         self.debug_images['5_最终标注'] = final.image_annotated

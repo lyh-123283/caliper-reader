@@ -120,50 +120,26 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
                                      main_gap: float,
                                      zero_x: float,
                                      binary: np.ndarray) -> tuple:
-    """v6.6: 圈出"zero_x 上方"的备选区二进制图，找游标 0 刻度线**左侧最近**主尺数字。
-
-    物理依据（用户提供）：
-      - 主尺数字在刻度线**上方**（在主尺行最顶刻度线之上）
-      - 数字下方对应主尺 cm 整数刻度位置
-      - 备选区宽度：zero_x - 1.2cm 到 zero_x + 0.3cm
-        （右边界略过 zero_x，确保 zero_x 投影到的 cm 数字也在区内）
-      - 备选区高度：主尺最顶刻度线 y - 2×tick_gap 到 y_top_tick
-
-    Args:
-        main_ticks: 主尺 tick 列表（每条含 x, y_start, y_end）
-        main_gap:   1mm 像素间距
-        zero_x:     游标 0 刻度线 x
-        binary:     主尺区域二值图（THRESH_BINARY_INV，黑前景=255）
-
-    Returns:
-        (binary_crop, x_offset, y_offset) 或 (None, 0, 0)
-        - binary_crop: 备选区二值图
-        - x_offset, y_offset: 在原图中的偏移
-    """
     if not main_ticks or main_gap <= 0 or zero_x <= 0 or binary is None:
         return None, 0, 0
 
     H, W = binary.shape[:2]
 
-    # 1. 找主尺刻度线上沿 y 位置（取最大值，因为数字在上方，下探越深越安全）
     y_starts = [t['y_start'] for t in main_ticks if 'y_start' in t]
     if len(y_starts) < 3:
         return None, 0, 0
     y_top_tick = max(y_starts)
 
-    # 2. 备选区 y 范围：整体上移 1*tick_gap
     y_top = max(0, y_top_tick - int(4 * main_gap))
     y_bottom = max(y_top + 8, y_top_tick - int(1 * main_gap))
     y_bottom = min(H, y_bottom)
 
-    # 3. 备选区 x 范围
-    cm_px = int(main_gap * 10)  # 1cm 像素
-    x_left = max(0, int(zero_x - 1.2 * cm_px))
-    x_right = min(W, int(zero_x + 0.3 * cm_px))
+    cm_px = int(main_gap * 10)
+    x_left = max(0, int(zero_x - 1.7 * cm_px))
+    x_right = min(W, int(zero_x + 0.4 * cm_px))
     if x_right - x_left < 8:
         return None, 0, 0
 
-    # 4. 裁剪
     binary_crop = binary[y_top:y_bottom, x_left:x_right].copy()
     return binary_crop, x_left, y_top
 

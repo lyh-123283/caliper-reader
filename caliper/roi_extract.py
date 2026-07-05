@@ -19,7 +19,9 @@ from .config import config
 
 def extract_roi(img_color: np.ndarray,
                 img_binary: np.ndarray,
-                img_enhanced: np.ndarray = None) -> dict:
+                img_enhanced: np.ndarray = None,
+                crop_gray: np.ndarray = None,
+                crop_binary: np.ndarray = None) -> dict:
     """
     利用二值图投影找到刻度密集区域并裁剪。
     不旋转——旋转留给 orient_caliper() 处理。
@@ -92,9 +94,11 @@ def extract_roi(img_color: np.ndarray,
 
     diag['y1'], diag['y2'], diag['x1'], diag['x2'] = y1, y2, x1, x2
 
+    gray_source = crop_gray if crop_gray is not None else enhanced
+    binary_source = crop_binary if crop_binary is not None else img_binary
     roi_color = img_color[y1:y2 + 1, x1:x2 + 1]
-    roi_gray = enhanced[y1:y2 + 1, x1:x2 + 1]
-    roi_binary = img_binary[y1:y2 + 1, x1:x2 + 1] if img_binary is not None else None
+    roi_gray = gray_source[y1:y2 + 1, x1:x2 + 1]
+    roi_binary = binary_source[y1:y2 + 1, x1:x2 + 1] if binary_source is not None else None
 
     # ── 可视化 ──
     mask_vis = _make_roi_vis_v3(img_color, roi_color, diag)

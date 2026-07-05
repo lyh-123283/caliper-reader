@@ -1,21 +1,11 @@
 """
-步骤 0 — 图像预处理（增强 + 滤波 + 二值化 + 后处理）
-
-流程:
-  1. 灰度化
-  2. 幂律变换（gamma 校正）— 全局亮度/对比度调节
-  3. 高斯模糊前置（轻量去纹理）
-  4. 双边滤波（保边去噪）
-  5. 中值滤波（去除脉冲/椒盐噪声，与双边互补）
-  6. CLAHE 对比度增强（局部自适应）
-  7. 非锐化掩膜（unsharp mask）锐化
-  8. 自适应阈值二值化
-  9. 形态学开运算（可选，清除孤立噪点）
- 10. 轮廓连通块过滤（可选，剔除小面积噪声斑块）
+步骤 0 — 图像预处理
 """
 
+import os
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from .config import config
 
 
@@ -34,18 +24,17 @@ def preprocess(img: np.ndarray,
         bilateral_d:     双边滤波直径（None=使用 config）
         bilateral_sigma: 双边滤波 sigma（None=使用 config）
         gamma:           幂律变换 gamma 值（None=使用 config → 1.0=不变；<1 提亮暗部；>1 压暗高光）
-        median_ksize:    中值滤波核尺寸（None=使用 config；奇数≥3；设为 0 跳过中值滤波）
+        median_ksize:    中值滤波核尺寸（None=使用 config；奇数>=3；设为 0 跳过）
 
     Returns:
         dict with keys:
             'color':             原始彩色图 (BGR)
             'gray':              原始灰度图
-            'enhanced':          增强后的灰度图 (gamma → gaussian → bilateral → median → CLAHE → unsharp)
+            'enhanced':          增强后的灰度图
             'binary_adaptive':   自适应阈值二值图 (THRESH_BINARY: 黑=刻度前景, 白=背景)
             'debug_vis':         可视化对比图（全步骤网格）
             'intermediates':     dict 中间步骤图像，供外部可视化使用
     """
-    # ── 参数默认值来自 config ──
     if clip_limit is None:
         clip_limit = config.preprocess.clahe_clip_limit
     if bilateral_d is None:
@@ -57,17 +46,12 @@ def preprocess(img: np.ndarray,
     if median_ksize is None:
         median_ksize = config.preprocess.median_ksize
     result = {'color': img.copy()}
-    intermediates = {}  # 收集中间步骤图像，供可视化使用
+    intermediates = {}
 
-    # ── 1. 灰度化 ──
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     result['gray'] = gray
     intermediates['01_gray'] = gray
 
-    # ── 2. 幂律变换（gamma 校正）──
-    #     物理意义：s = c * r^(1/gamma)
-    #     gamma < 1 → 扩展暗部、提亮图像 → 刻线区域更可见
-    #     gamma > 1 → 压缩暗部、压暗图像 → 抑制过曝反光
     if gamma != 1.0:
         inv_gamma = 1.0 / gamma
         table = np.array(
@@ -76,55 +60,36 @@ def preprocess(img: np.ndarray,
         gray = cv2.LUT(gray, table)
     intermediates['02_gamma'] = gray.copy()
 
-    # ── 2b. 高斯模糊前置（轻量去纹理噪声，双边之前）──
-    gk = config.preprocess.gauss_pre_ksize
-    if gk >= 3:
-        gk = gk if gk % 2 == 1 else gk + 1
-        gray = cv2.GaussianBlur(gray, (gk, gk), config.preprocess.gauss_pre_sigma)
-    intermediates['03_gauss'] = gray.copy()
-
-    # ── 3. 双边滤波（保边去噪）──
     denoised = cv2.bilateralFilter(gray, bilateral_d, bilateral_sigma, bilateral_sigma)
-    intermediates['04_bilateral'] = denoised.copy()
+    intermediates['03_bilateral'] = denoised.copy()
 
-    # ── 4. 中值滤波（去除脉冲/椒盐噪声，与双边互补）──
     if median_ksize >= 3:
-        # 确保核尺寸为奇数
         ksize = median_ksize if median_ksize % 2 == 1 else median_ksize + 1
         denoised = cv2.medianBlur(denoised, ksize)
-    intermediates['05_median'] = denoised.copy()
+        intermediates['04_median'] = denoised.copy()
 
-    # ── 5. CLAHE 对比度增强（局部自适应直方图均衡）──
     clahe = cv2.createCLAHE(
         clipLimit=clip_limit,
         tileGridSize=(config.preprocess.clahe_tile_w, config.preprocess.clahe_tile_h))
     enhanced = clahe.apply(denoised)
-    intermediates['06_clahe'] = enhanced.copy()
+    intermediates['05_clahe'] = enhanced.copy()
 
-    # ── 6. 非锐化掩膜锐化（unsharp mask）──
-    #     标准公式：sharp = orig + amount × (orig - blur)
-    #     amount=0 → 不变；amount=1 → 标准锐化；amount=1.5 → 强锐化
     if config.preprocess.unsharp_amount > 0.01:
         blur = cv2.GaussianBlur(enhanced, (0, 0), config.preprocess.unsharp_blur_sigma)
-        # cv2.addWeighted(orig, 1+a, blur, -a, 0) 实现 orig + a*(orig - blur)
         a = config.preprocess.unsharp_amount
         enhanced = cv2.addWeighted(enhanced, 1.0 + a, blur, -a, 0)
-    intermediates['07_unsharp'] = enhanced.copy()
+    intermediates['06_unsharp'] = enhanced.copy()
     result['enhanced'] = enhanced
 
-    # ── 7. 自适应阈值二值化 ──
-    #     输出 THRESH_BINARY：黑字/黑线 = 前景（刻度），白底 = 背景
-    #     便于人眼直观看懂；下游 ROI 投影步骤内部会反色处理。
     binary_adaptive = cv2.adaptiveThreshold(
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,           # ← 黑前景/白背景（人眼友好）
+        cv2.THRESH_BINARY,
         blockSize=config.preprocess.adaptive_block_size,
         C=config.preprocess.adaptive_C
     )
-    intermediates['08_adaptive_bin'] = binary_adaptive.copy()
+    intermediates['07_adaptive_bin'] = binary_adaptive.copy()
 
-    # ── 9. 后处理：形态学开运算（二值化后清除孤立噪点）──
     if config.preprocess.morph_open_enabled:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -134,37 +99,60 @@ def preprocess(img: np.ndarray,
             binary_adaptive, cv2.MORPH_OPEN, kernel,
             iterations=config.preprocess.morph_open_iterations,
         )
-    intermediates['09_morph_open'] = binary_adaptive.copy()
+    intermediates['08_morph_open'] = binary_adaptive.copy()
 
-    # ── 10. 后处理：轮廓连通块过滤（剔除小面积噪声斑块）──
     if config.preprocess.cc_filter_enabled:
         min_area = config.preprocess.cc_min_area
-
-        # 既过滤黑前景里夹的白岛，也过滤白背景上的孤立黑点。
-        # 这里用 findContours + 局部像素计数替代 connectedComponents 的全图标签扫描。
         binary_adaptive = _filter_small_components_by_contour(
             binary_adaptive, min_area)
 
-    # ── 后处理结束后，同步更新 result ──
-    intermediates['10_cc_filter'] = binary_adaptive.copy()
+    intermediates['09_cc_filter'] = binary_adaptive.copy()
     result['binary_adaptive'] = binary_adaptive
 
-    # ── 生成可视化（全步骤网格）──
+    roi_enhanced, roi_binary = _make_roi_structural_images(result['gray'])
+    result['roi_enhanced'] = roi_enhanced
+    result['roi_binary'] = roi_binary
+
     result['intermediates'] = intermediates
     result['debug_vis'] = _make_preprocess_vis(img, intermediates, gamma, median_ksize)
 
     return result
 
 
+def _make_roi_structural_images(gray: np.ndarray) -> tuple:
+    inv_gamma = 1.0 / config.preprocess.gamma if config.preprocess.gamma else 1.0
+    if abs(inv_gamma - 1.0) > 1e-6:
+        table = np.array(
+            [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
+        ).astype(np.uint8)
+        work = cv2.LUT(gray, table)
+    else:
+        work = gray.copy()
+
+    work = cv2.bilateralFilter(work, 11, 60.0, 60.0)
+    work = cv2.medianBlur(work, 9)
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    enhanced = clahe.apply(work)
+    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
+    enhanced = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
+
+    binary = cv2.adaptiveThreshold(
+        enhanced, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        blockSize=31,
+        C=5,
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+    binary = _filter_small_components_by_contour(binary, 50)
+    return enhanced, binary
+
+
 def _filter_small_components_by_contour(binary: np.ndarray,
                                         min_area: int) -> np.ndarray:
-    """Remove small white and black components without repeated full-image scans."""
     out = binary.copy()
-
-    # Small white islands are turned black.
     _fill_small_contours(out, out.copy(), min_area, 0)
-
-    # Small black specks are white in the inverted mask and are turned white.
     inverted = cv2.bitwise_not(out)
     _fill_small_contours(out, inverted, min_area, 255)
 
@@ -202,7 +190,6 @@ def _make_preprocess_vis(original: np.ndarray,
                           intermediates: dict,
                           gamma: float = 1.0,
                           median_ksize: int = 3) -> np.ndarray:
-    """生成预处理关键步骤可视化，保留少量大图方便肉眼检查。"""
     h, w = original.shape[:2]
 
     cell_w = 520
@@ -210,7 +197,6 @@ def _make_preprocess_vis(original: np.ndarray,
     cell_h = max(int(h * scale), 40)
 
     def _resize_gray(img):
-        """安全缩放灰度图并转 BGR"""
         if img is None:
             return np.zeros((cell_h, cell_w, 3), dtype=np.uint8)
         if len(img.shape) == 3 and img.shape[2] == 3:
@@ -221,17 +207,17 @@ def _make_preprocess_vis(original: np.ndarray,
 
     bg_color = (30, 30, 35)
     gap = 6
-    label_h = 24
+    label_h = 28
     cols = 2
     steps = [
-        ("Original", original, (210, 210, 210)),
-        ("Enhanced", intermediates.get('07_unsharp', intermediates.get('06_clahe')), (120, 200, 255)),
-        ("Adaptive Binary", intermediates.get('08_adaptive_bin'), (100, 255, 160)),
-        ("Final Filtered", intermediates.get('10_cc_filter'), (255, 180, 120)),
+        ("原图", original, (210, 210, 210)),
+        ("增强图", intermediates.get('06_unsharp', intermediates.get('05_clahe')), (120, 200, 255)),
+        ("自适应二值图", intermediates.get('07_adaptive_bin'), (100, 255, 160)),
+        ("最终过滤图", intermediates.get('09_cc_filter'), (255, 180, 120)),
     ]
     rows = 2
     out_w = cols * cell_w + gap * (cols - 1) + 16
-    out_h = rows * (cell_h + label_h + gap) + gap + 30
+    out_h = rows * (cell_h + label_h + gap) + gap + 34
     vis = np.zeros((out_h, out_w, 3), dtype=np.uint8)
     vis[:] = bg_color
 
@@ -247,11 +233,46 @@ def _make_preprocess_vis(original: np.ndarray,
         bar_y = y0 + cell_h
         bar = np.zeros((label_h, cell_w, 3), dtype=np.uint8)
         bar[:] = (35, 35, 40)
-        cv2.putText(bar, name, (6, label_h - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+        _draw_chinese_text(bar, name, (8, 5), font_size=16, color=color)
         vis[bar_y:bar_y + label_h, x0:x0 + cell_w] = bar
 
-    cv2.putText(vis, "STEP 0: Preprocess key views - black=ticks/text, white=background",
-                (8, out_h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 140, 145), 1)
+    _draw_chinese_text(
+        vis,
+        "步骤0：图像预处理关键视图（黑色=刻线/文字，白色=背景）",
+        (8, out_h - 26),
+        font_size=16,
+        color=(140, 140, 145),
+    )
 
     return vis
+
+
+def _draw_chinese_text(img: np.ndarray,
+                       text: str,
+                       xy: tuple,
+                       font_size: int = 16,
+                       color=(220, 220, 220)) -> None:
+    font = _get_chinese_font(font_size)
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil_img = Image.fromarray(rgb)
+    draw = ImageDraw.Draw(pil_img)
+    b, g, r = color
+    draw.text(xy, text, font=font, fill=(r, g, b))
+    img[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def _get_chinese_font(size: int):
+    font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+    candidates = [
+        os.path.join(font_dir, "msyh.ttc"),
+        os.path.join(font_dir, "simhei.ttf"),
+        os.path.join(font_dir, "simsun.ttc"),
+        os.path.join(font_dir, "msyh.ttf"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except OSError:
+                continue
+    return ImageFont.load_default()

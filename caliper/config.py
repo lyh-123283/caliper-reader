@@ -23,7 +23,7 @@
 # ═════════════════════════════════════════════════════════════
 
 class PreprocessConfig:
-    """预处理参数：灰度 → gamma 校正 → 双边滤波 → 中值滤波 → CLAHE → 钝化 → 二值化"""
+    """预处理参数：灰度 → gamma 校正 → 轻量去噪 → CLAHE → 锐化 → 二值化"""
 
     # ── 幂律变换 (gamma 校正) ──
     #     公式: s = 255 * (r/255)^(1/gamma)
@@ -31,26 +31,15 @@ class PreprocessConfig:
     #     典型范围: 0.6 ~ 1.5
     gamma: float = 1.5
 
-    # ── 高斯模糊前置（在双边之前轻量去纹理噪声）──
-    #     ksize: 核尺寸（奇数，典型 3~5）；设为 0 跳过
-    #     sigma: 标准差（典型 0.5~1.0）
-    gauss_pre_ksize: int = 0
-    gauss_pre_sigma: float = 0.8
+    bilateral_d: int = 5
+    bilateral_sigma: float = 25.0
 
-    # ── 双边滤波（保边去噪）──
-    #     直径: 像素邻域直径，越大平滑越强但越慢
-    #     sigma: 颜色/空间标准差，越大平滑越强
-    bilateral_d: int = 11
-    bilateral_sigma: float = 60.0
-
-    # ── 中值滤波（脉冲/椒盐噪声）──
-    #     核尺寸（奇数），≥3 生效；设为 0 跳过中值滤波
-    median_ksize: int = 9
+    median_ksize: int = 0
 
     # ── CLAHE 对比度增强（局部自适应直方图均衡）──
     #     clip_limit: 对比度限制，越大对比度越强（也放大噪声）
     #     tile_grid: 分块大小，(8,8) 是常规默认
-    clahe_clip_limit: float = 1.5
+    clahe_clip_limit: float = 1.0
     clahe_tile_w: int = 8
     clahe_tile_h: int = 8
 
@@ -59,18 +48,18 @@ class PreprocessConfig:
     #     amount=0   → 不变（跳过锐化）
     #     amount=0.5 → 轻微锐化（默认，平衡刻度可见性 vs 噪声放大）
     #     amount=1.5 → 强锐化（可能引入噪声，下游过检）
-    unsharp_amount: float = 0.5
+    unsharp_amount: float = 0.25
     unsharp_blur_sigma: float = 1.5
 
     # ── 自适应阈值二值化 ──
     #     block_size: 局部邻域大小（奇数），越大对光照鲁棒但细节损失
     #     C: 从均值中减去的常数，越大二值化越保守（白像素越少）
-    adaptive_block_size: int = 31
-    adaptive_C: int = 5
+    adaptive_block_size: int = 91
+    adaptive_C: int = 17
 
     # ── 后处理：形态学开运算（二值化后去噪）──
     #     先腐蚀再膨胀，消除孤立小噪点
-    morph_open_enabled: bool = True
+    morph_open_enabled: bool = False
     morph_open_kernel_size: int = 3   # 核尺寸（椭圆核）
     morph_open_iterations: int = 1    # 迭代次数
 

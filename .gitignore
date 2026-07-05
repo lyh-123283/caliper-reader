@@ -11,22 +11,18 @@ build/
 venv/
 env/
 
-# 调试输出目录
-_debug_out/
+# 调试输出
+debug_*/
 debug_*.png
+_debug_out/
+results/
 
-# 参数测试相关
+# 参数测试输出
 param_search_results/
 param_*_test/
 param_*_test2/
 param_visualizations/
 
-# 结果输出
-results/
-
 # IDE
 .vscode/
 .idea/
-
-# 编辑器配置（保留）
-# .editorconfig 保留

@@ -591,9 +591,8 @@ def _filter_vernier_ticks_by_grid(vernier_ticks: List[dict], main_gap: float) ->
 
     ticks = sorted(vernier_ticks, key=lambda t: t['x'])
 
-    # Remove duplicate detections around the same physical tick.
     deduped = []
-    dup_tol = max(3.0, expected * 0.35)
+    dup_tol = max(3.0, expected * 0.60)
     for t in ticks:
         if deduped and t['x'] - deduped[-1]['x'] < dup_tol:
             if _tick_grid_priority(t) > _tick_grid_priority(deduped[-1]):
@@ -629,9 +628,89 @@ def _filter_vernier_ticks_by_grid(vernier_ticks: List[dict], main_gap: float) ->
         if len(seq) > len(best):
             best = seq
 
+    median_len = float(np.median([t.get('length', 0) for t in deduped])) if deduped else 0.0
+    min_start_len = median_len * 0.70
+    min_initial = 5
+    min_total = max(12, config.vernier_scale.min_tick_count)
+    for start_tick in deduped:
+        if start_tick.get('length', 0) < min_start_len:
+            continue
+        seq = _collect_vernier_grid_sequence(deduped, start_tick, expected, tol)
+        if len(seq) < min_total:
+            continue
+        if _initial_grid_streak(seq, expected, tol) >= min_initial:
+            return sorted(seq, key=lambda t: t['x'])
+
     if len(best) >= max(6, config.vernier_scale.min_tick_count):
         return sorted(best, key=lambda t: t['x'])
     return vernier_ticks
+
+
+def _collect_vernier_grid_sequence(ticks: List[dict],
+                                   start_tick: dict,
+                                   expected: float,
+                                   tol: float) -> List[dict]:
+    seq = [start_tick]
+    used = {id(start_tick)}
+    start_x = float(start_tick['x'])
+    prev_x = start_x
+    for k in range(1, 60):
+        target = start_x + expected * k
+        candidates = [
+            t for t in ticks
+            if id(t) not in used
+            and abs(float(t['x']) - target) <= tol
+            and float(t['x']) > prev_x + expected * 0.35
+        ]
+        if not candidates:
+            continue
+        nxt = min(candidates, key=lambda t: (
+            abs(float(t['x']) - target),
+            -_tick_grid_priority(t)[0],
+            -_tick_grid_priority(t)[1],
+        ))
+        seq.append(nxt)
+        used.add(id(nxt))
+        prev_x = float(nxt['x'])
+    return sorted(seq, key=lambda t: t['x'])
+
+
+def _initial_grid_streak(seq: List[dict], expected: float, tol: float) -> int:
+    if not seq:
+        return 0
+    xs = [float(t['x']) for t in sorted(seq, key=lambda item: item['x'])]
+    start_x = xs[0]
+    streak = 0
+    for k in range(0, 20):
+        target = start_x + expected * k
+        if any(abs(x - target) <= tol for x in xs):
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _sync_band_detection_ticks(band_detection: dict, vernier_ticks: List[dict]) -> dict:
+    if not band_detection or not vernier_ticks:
+        return band_detection
+
+    x1 = int(band_detection.get('x1', 0))
+    band = band_detection.get('band')
+    band_w = band.shape[1] if band is not None and band.size else None
+    local_xs = []
+    global_xs = []
+    for t in sorted(vernier_ticks, key=lambda item: item['x']):
+        gx = int(round(t['x']))
+        lx = gx - x1
+        if band_w is not None and (lx < 0 or lx >= band_w):
+            continue
+        local_xs.append(lx)
+        global_xs.append(gx)
+
+    if len(local_xs) >= config.vernier_scale.min_tick_count:
+        band_detection['tick_xs_local'] = local_xs
+        band_detection['tick_xs_global'] = global_xs
+    return band_detection
 
 
 def _tick_grid_priority(tick: dict) -> tuple:
@@ -1206,11 +1285,12 @@ def _apply_near_integer_snap(mapped_ticks: List[dict],
         return mapped_ticks, corrected_ticks, zero_x, zero_x_corrected, snap_info
 
     long_ticks = [t for t in main_ticks if t.get('is_long')]
-    if not long_ticks:
-        lengths = [float(t.get('length', 0)) for t in main_ticks]
-        if lengths:
-            med_len = float(np.median(lengths))
-            long_ticks = [t for t in main_ticks if float(t.get('length', 0)) >= med_len * 1.18]
+    lengths = [float(t.get('length', 0)) for t in main_ticks]
+    if lengths:
+        med_len = float(np.median(lengths))
+        secondary = [t for t in main_ticks if float(t.get('length', 0)) >= med_len * 1.18]
+        if len(secondary) > len(long_ticks):
+            long_ticks = secondary
     if not long_ticks:
         return mapped_ticks, corrected_ticks, zero_x, zero_x_corrected, snap_info
 
@@ -1231,7 +1311,7 @@ def _apply_near_integer_snap(mapped_ticks: List[dict],
         nearest = min(main_xs, key=lambda x: abs(x - tx))
         offsets.append(tx - nearest)
     median_offset = float(np.median(offsets))
-    spread = float(np.std(offsets))
+    spread = float(np.median(np.abs(np.array(offsets, dtype=float) - median_offset)))
     if abs(median_offset + shift) > max(1.5, main_gap * 0.08):
         return mapped_ticks, corrected_ticks, zero_x, zero_x_corrected, snap_info
     if spread > max(1.5, main_gap * 0.10):
@@ -1750,9 +1830,12 @@ def recognize_vernier_scale(region: dict,
         if len(vernier_ticks) < config.vernier_scale.min_tick_count:
             return _empty_vernier_result()
 
-    vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
-
     precision = 0.02
+    grid_ticks = _filter_vernier_ticks_by_grid(vernier_ticks, main_gap)
+    if len(grid_ticks) >= config.vernier_scale.min_tick_count:
+        vernier_ticks = grid_ticks
+        band_detection = _sync_band_detection_ticks(band_detection, vernier_ticks)
+    vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
     v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else 0.0
 
     zero_tick, zero_digit_found, valley_vis = _find_zero_from_projection_valley(
@@ -1769,12 +1852,6 @@ def recognize_vernier_scale(region: dict,
             v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else v_gap
 
     if zero_tick is None:
-        grid_ticks = _filter_vernier_ticks_by_grid(vernier_ticks, main_gap)
-        if len(grid_ticks) >= config.vernier_scale.min_tick_count:
-            vernier_ticks = grid_ticks
-            vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
-            v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else v_gap
-
         zero_tick, zero_digit_found = _find_zero_tick(vernier_ticks, region)
         zero_x = float(zero_tick['x']) if zero_tick else float(vernier_ticks[0]['x'])
 

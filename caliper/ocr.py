@@ -473,7 +473,7 @@ class DigitReader:
             if not text.isdigit():
                 continue
             value = int(text)
-            if value > 12:  # 主尺 cm 标记最大 12
+            if value > 15:
                 continue
             return DigitInfo(
                 x=cx, y=cy, value=value,
@@ -548,7 +548,7 @@ class DigitReader:
             if not text.isdigit():
                 continue
             value = int(text)
-            if value > 12:  # 主尺 cm 标记最大 12
+            if value > 15:
                 continue
             x1, y1, x2, y2 = bbox
             cx = (x1 + x2) // 2

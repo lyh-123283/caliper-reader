@@ -17,8 +17,7 @@ def merge_readings(main_result: dict,
                     rotated_color: np.ndarray,
                     region_main: dict,
                     region_vernier: dict,
-                    split_y: int,
-                    skip_ocr: bool = False) -> CaliperResult:
+                    split_y: int) -> CaliperResult:
     """
     合并主尺和游标尺读数，生成最终结果
 
@@ -49,8 +48,7 @@ def merge_readings(main_result: dict,
     # ── 计算主尺整数读数（附带推导诊断信息）──
     main_reading, main_derivation = _compute_main_reading_with_info(
         main_ticks, main_digits, main_gap, zero_x,
-        gray_region=main_gray, binary_region=main_binary,
-        skip_ocr=skip_ocr)
+        gray_region=main_gray, binary_region=main_binary)
 
     # ── 游标对齐索引 ──
     aligned_tick = vernier_result.get('aligned_tick')
@@ -102,7 +100,6 @@ def merge_readings(main_result: dict,
             'main_digits': [(d.text, d.value, d.x) for d in main_digits],
             'main_derivation': main_derivation,
             'derivation_vis': derivation_vis,
-            'skip_ocr': skip_ocr,
         },
     )
 
@@ -147,58 +144,33 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
                                      zero_x: float,
                                      gray_region: np.ndarray = None,
                                      binary_region: np.ndarray = None,
-                                     main_color_region: np.ndarray = None,
-                                     skip_ocr: bool = False) -> tuple:
-    """计算主尺读数 + 返回推导所需的诊断信息。
-
-    v6.5: 重写为"定向 OCR"。
-    - 优先用 find_cm_digit_candidates 找 zero_x 左侧 1~2 个 cm 整数刻度
-    - 对每个候选 x 调 DigitReader.read_digit_at() 识别数字
-    - 选 nearest 数字 + 数 extra_ticks（mm 数）
-    - 读数 = digit.value × 10 + extra_ticks（OCR 数字是 cm 整数）
-    - OCR 失败时回退到纯几何法
-
-    Returns:
-        (reading, dict):
-            nearest_digit: 零线左侧最近的 OCR 数字 (DigitInfo 或 None)
-            extra_ticks:   从该数字到零线的额外刻度线数量（mm）
-            strategy:      'ocr' | 'ocr_failed' | 'skipped'
-    """
+                                     main_color_region: np.ndarray = None) -> tuple:
     if main_gap <= 0:
         return _ocr_failed_reading('invalid_main_gap')
 
     main_xs = _dedupe_main_xs([t['x'] for t in main_ticks], main_gap) if main_ticks else []
-    if skip_ocr:
-        return _ocr_failed_reading('skip_ocr', ocr_engine='skipped', skip_ocr=True)
 
-    # ── 策略 1：备选区 + 连通域筛选（v6.6） ──
     if main_xs and zero_x > 0 and gray_region is not None and binary_region is not None:
         from .ocr import get_ocr_reader_singleton
         from .main_scale import find_nearest_cm_digit_region, find_digit_cc_candidates
 
-        # 1. 框出"zero_x 上方"备选区
         binary_crop, x_off, y_off = find_nearest_cm_digit_region(
             main_ticks, main_gap, zero_x, binary_region)
         if binary_crop is None:
             return _ocr_failed_reading('no_digit_region')
 
-        # 2. 在备选区找最像数字的连通域
         cc_candidates = find_digit_cc_candidates(binary_crop, x_off, y_off, zero_x)
         if not cc_candidates:
             return _ocr_failed_reading('no_digit_component')
 
-        # 3. 对 patch 做 OCR
         reader = get_ocr_reader_singleton()
         engine = reader.engine_status() if hasattr(reader, 'engine_status') else reader.engine_name()
-        ocr_candidates = []
+        char_candidates = []
         for cc in cc_candidates:
             digit = reader.ocr_patch_to_digit(cc['digit_crop'], cc['bbox'], gray_region)
             if digit is None or digit.value < 0:
                 continue
-            ref_tick = _bind_digit_to_cm_tick(digit, main_ticks, main_gap)
-            if ref_tick is None:
-                continue
-            ocr_candidates.append({
+            char_candidates.append({
                 'digit': digit,
                 'value': digit.value,
                 'text': digit.text,
@@ -206,14 +178,14 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
                 'bbox': cc['bbox'],
                 'cc_confidence': cc['confidence'],
                 'center_x': cc['center_x'],
-                'ref_tick_x': float(ref_tick['x']),
+                'source': 'single_char',
             })
+
+        ocr_candidates = _group_main_ocr_labels(char_candidates, main_ticks, main_gap)
         if not ocr_candidates:
             return _ocr_failed_reading('ocr_no_digit', ocr_engine=engine)
 
-        # 4. 算 extra_ticks = digit bbox 下沿到 zero_x 之间的主尺刻度线数（mm）
-        #    digit.x 是 patch 中心，用最接近的 main_tick 作为 ref
-        side_tol = max(1.5, main_gap * 0.08)
+        side_tol = max(4.0, main_gap * 0.20)
         usable = [c for c in ocr_candidates if c['ref_tick_x'] <= zero_x + side_tol]
         if not usable:
             return _ocr_failed_reading('no_ocr_digit_left_of_zero', ocr_engine=engine)
@@ -224,7 +196,6 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
         digit = selected['digit']
         ref_x = selected['ref_tick_x']
         extra_ticks = sum(1 for x in main_xs if ref_x + main_gap * 0.3 < x <= zero_x)
-        # 5. 读数 = digit.value × 10（cm → mm）+ extra_ticks
         reading = float(digit.value) * 10 + extra_ticks
         return reading, {
             'nearest_digit': digit,
@@ -237,51 +208,123 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
             'ocr_candidates': _summarize_ocr_candidates(ocr_candidates, selected),
         }
 
-    # ── 策略 2/3：纯几何回退（OCR 路径无结果时） ──
     return _ocr_failed_reading('missing_ocr_inputs')
 
 
 def _ocr_failed_reading(reason: str,
-                        ocr_engine: str = None,
-                        skip_ocr: bool = False) -> tuple:
-    strategy = 'skipped' if skip_ocr else 'ocr_failed'
+                        ocr_engine: str = None) -> tuple:
     return 0.0, {
         'nearest_digit': None,
         'extra_ticks': 0,
-        'strategy': strategy,
+        'strategy': 'ocr_failed',
         'ocr_reason': reason,
         'ocr_engine': ocr_engine,
-        'skip_ocr': skip_ocr,
     }
 
 
 def _bind_digit_to_cm_tick(digit: DigitInfo,
                            main_ticks: List[dict],
                            main_gap: float) -> dict:
-    """Bind an OCR digit to the nearest centimeter-length main-scale tick."""
     if digit is None or not main_ticks or main_gap <= 0:
+        return None
+    return _bind_label_x_to_cm_tick(float(digit.x), main_ticks, main_gap, tolerance_ratio=0.65)
+
+
+def _bind_label_x_to_cm_tick(label_x: float,
+                             main_ticks: List[dict],
+                             main_gap: float,
+                             tolerance_ratio: float = 0.65) -> dict:
+    if label_x is None or not main_ticks or main_gap <= 0:
         return None
     cm_ticks = _main_cm_ticks(main_ticks, main_gap)
     if not cm_ticks:
         return None
-    center_x = float(digit.x)
+    center_x = float(label_x)
     nearest = min(cm_ticks, key=lambda t: abs(float(t['x']) - center_x))
-    if abs(float(nearest['x']) - center_x) > max(8.0, main_gap * 0.65):
+    if abs(float(nearest['x']) - center_x) > max(8.0, main_gap * tolerance_ratio):
         return None
     return nearest
 
 
+def _group_main_ocr_labels(char_candidates: list,
+                           main_ticks: List[dict],
+                           main_gap: float) -> list:
+    if not char_candidates:
+        return []
+
+    chars = sorted(char_candidates, key=lambda c: (c.get('bbox') or (c.get('center_x', 0),))[0])
+    grouped = []
+    gap_tol = max(6.0, main_gap * 0.45)
+    i = 0
+    while i < len(chars):
+        cur = chars[i]
+        cur_bbox = cur.get('bbox')
+        next_item = chars[i + 1] if i + 1 < len(chars) else None
+        if cur.get('value') == 1 and cur_bbox and next_item and next_item.get('bbox'):
+            nxt = next_item
+            nxt_bbox = nxt['bbox']
+            x_gap = float(nxt_bbox[0] - cur_bbox[2])
+            combined_value = 10 + int(nxt.get('value', -99))
+            if 0 <= x_gap <= gap_tol and 10 <= combined_value <= 15:
+                bbox = (
+                    min(cur_bbox[0], nxt_bbox[0]),
+                    min(cur_bbox[1], nxt_bbox[1]),
+                    max(cur_bbox[2], nxt_bbox[2]),
+                    max(cur_bbox[3], nxt_bbox[3]),
+                )
+                center_x = (bbox[0] + bbox[2]) / 2.0
+                center_y = (bbox[1] + bbox[3]) / 2.0
+                conf = min(float(cur.get('confidence', 0.0)),
+                           float(nxt.get('confidence', 0.0)))
+                cc_conf = min(float(cur.get('cc_confidence', 0.0)),
+                              float(nxt.get('cc_confidence', 0.0)))
+                grouped.append({
+                    'digit': DigitInfo(
+                        x=int(round(center_x)),
+                        y=int(round(center_y)),
+                        value=combined_value,
+                        text=str(combined_value),
+                        confidence=conf,
+                        bbox=bbox,
+                    ),
+                    'value': combined_value,
+                    'text': str(combined_value),
+                    'confidence': conf,
+                    'bbox': bbox,
+                    'cc_confidence': cc_conf,
+                    'center_x': center_x,
+                    'source': 'grouped_2digit',
+                    'children': [cur, nxt],
+                })
+                i += 2
+                continue
+
+        grouped.append(dict(cur))
+        i += 1
+
+    labels = []
+    for label in grouped:
+        tolerance_ratio = 1.2 if label.get('source') == 'grouped_2digit' else 0.65
+        ref_tick = _bind_label_x_to_cm_tick(label.get('center_x'), main_ticks, main_gap, tolerance_ratio)
+        if ref_tick is None:
+            continue
+        label = dict(label)
+        label['ref_tick_x'] = float(ref_tick['x'])
+        labels.append(label)
+    return labels
+
+
 def _main_cm_ticks(main_ticks: List[dict], main_gap: float) -> List[dict]:
-    """Return deduped long ticks, which correspond to centimeter marks."""
     if not main_ticks:
         return []
     long_ticks = [t for t in main_ticks if t.get('is_long')]
-    if not long_ticks:
-        lengths = [float(t.get('length', 0)) for t in main_ticks]
-        if not lengths:
-            return []
-        median_len = float(np.median(lengths))
-        long_ticks = [t for t in main_ticks if float(t.get('length', 0)) >= median_len * 1.18]
+    lengths = [float(t.get('length', 0)) for t in main_ticks]
+    if not lengths:
+        return []
+    median_len = float(np.median(lengths))
+    secondary = [t for t in main_ticks if float(t.get('length', 0)) >= median_len * 1.18]
+    if len(secondary) > len(long_ticks):
+        long_ticks = secondary
     if not long_ticks:
         return []
 
@@ -325,6 +368,7 @@ def _summarize_ocr_candidates(candidates: list, selected: dict = None) -> list:
             'bbox': c.get('bbox'),
             'center_x': c.get('center_x'),
             'ref_tick_x': ref_tick_x,
+            'source': c.get('source'),
             'selected': selected_ref is not None and ref_tick_x is not None
                         and abs(ref_tick_x - selected_ref) < 1e-6,
         })

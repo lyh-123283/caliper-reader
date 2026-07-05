@@ -40,6 +40,8 @@ def split_scales(rotated_gray: np.ndarray,
     # shifted crop line.
     split_y = _split_by_vernier_tick_band(rotated_gray, binary, h, w)
     if split_y is None:
+        split_y = _split_by_gray_seam(rotated_gray, h, w)
+    if split_y is None:
         split_y = _split_by_candidate_scan(rotated_gray, binary, h, w)
 
     # ── 最终回退（基于物理先验：主尺约占ROI高度的60%）──
@@ -107,6 +109,80 @@ def _split_by_vernier_tick_band(gray: np.ndarray, binary: np.ndarray,
         return None
 
     return best_y
+
+
+def _split_by_gray_seam(gray: np.ndarray, h: int, w: int):
+    if gray is None or h < 20 or w < 20:
+        return None
+
+    lo, hi = int(h * 0.38), int(h * 0.78)
+    if hi <= lo:
+        return None
+
+    x1, x2 = int(w * 0.18), int(w * 0.86)
+    if x2 - x1 < max(20, w * 0.20):
+        x1, x2 = 0, w
+
+    crop = gray[:, x1:x2]
+    row_mean = np.mean(crop, axis=1).astype(float)
+    scharr_y = cv2.Scharr(crop, cv2.CV_32F, 0, 1)
+    row_edge = np.mean(np.abs(scharr_y), axis=1).astype(float)
+
+    win = max(5, h // 90)
+    if win % 2 == 0:
+        win += 1
+    kernel = np.ones(win, dtype=float) / win
+    smooth_mean = np.convolve(row_mean, kernel, mode='same')
+    smooth_edge = np.convolve(row_edge, kernel, mode='same')
+
+    mean_win = smooth_mean[lo:hi + 1]
+    edge_win = smooth_edge[lo:hi + 1]
+    if mean_win.size == 0 or edge_win.size == 0:
+        return None
+
+    dark = float(np.max(mean_win)) - smooth_mean
+    dark_win = dark[lo:hi + 1]
+    dark_norm = _norm01(dark_win)
+    edge_norm = _norm01(edge_win)
+    local_contrast = _row_local_contrast(smooth_mean, lo, hi, max(4, h // 80))
+
+    score = 0.48 * edge_norm + 0.32 * dark_norm + 0.20 * local_contrast
+    if score.size == 0:
+        return None
+
+    best_rel = int(np.argmax(score))
+    best_y = lo + best_rel
+    if float(score[best_rel]) < 0.28:
+        return None
+    if float(edge_norm[best_rel]) < 0.20 and float(dark_norm[best_rel]) < 0.35:
+        return None
+
+    return best_y
+
+
+def _norm01(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return values
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+    if vmax - vmin < 1e-6:
+        return np.zeros_like(values, dtype=float)
+    return (values - vmin) / (vmax - vmin)
+
+
+def _row_local_contrast(row: np.ndarray, lo: int, hi: int, radius: int) -> np.ndarray:
+    out = []
+    n = len(row)
+    for y in range(lo, hi + 1):
+        a1 = max(0, y - radius)
+        a2 = max(a1 + 1, y - max(1, radius // 3))
+        b1 = min(n - 1, y + max(1, radius // 3))
+        b2 = min(n, y + radius)
+        above = float(np.mean(row[a1:a2])) if a2 > a1 else float(row[y])
+        below = float(np.mean(row[b1:b2])) if b2 > b1 else float(row[y])
+        out.append(abs(above - below))
+    return _norm01(np.array(out, dtype=float))
 
 
 def _split_by_candidate_scan(gray: np.ndarray, binary: np.ndarray,

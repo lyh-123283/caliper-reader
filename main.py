@@ -63,7 +63,6 @@ class CaliperApp:
         self._is_processing = False
         self._latest_file_path = ""
         self._auto_follow_progress = True
-        self.skip_ocr_var = tk.BooleanVar(value=False)
 
         # 动态标签页
         self.tab_widgets = {}
@@ -138,21 +137,6 @@ class CaliperApp:
             command=self._open_image
         )
         self.btn_open.pack(fill=tk.X, pady=(0, 10))
-
-        self.chk_skip_ocr = tk.Checkbutton(
-            inner,
-            text="跳过 OCR（算法调试）",
-            variable=self.skip_ocr_var,
-            font=('Microsoft YaHei', 9),
-            bg=self.card_color,
-            fg="#a6adc8",
-            activebackground=self.card_color,
-            activeforeground=self.fg_color,
-            selectcolor=self.bg_color,
-            anchor=tk.W,
-            cursor="hand2",
-        )
-        self.chk_skip_ocr.pack(fill=tk.X, pady=(0, 8))
 
         # 结果展示区
         tk.Label(
@@ -486,12 +470,9 @@ class CaliperApp:
         self._is_processing = True
         self._latest_file_path = file_path
         self._auto_follow_progress = True
-        skip_ocr = bool(self.skip_ocr_var.get())
         self.btn_open.config(state=tk.DISABLED)
-        self.chk_skip_ocr.config(state=tk.DISABLED)
         self.btn_save.config(state=tk.DISABLED, bg="#45475a", fg=self.fg_color)
-        mode_text = "（跳过 OCR）" if skip_ocr else ""
-        self.status_label.config(text=f"⏳ 正在识别{mode_text}: {os.path.basename(file_path)} ...")
+        self.status_label.config(text=f"⏳ 正在识别: {os.path.basename(file_path)} ...")
         self.root.update_idletasks()
 
         def worker():
@@ -508,7 +489,6 @@ class CaliperApp:
                     )
 
                 self.root.after(0, lambda: self._on_image_loaded_for_progress(img))
-                self.pipeline.set_skip_ocr(skip_ocr)
                 result = self.pipeline.run(img, progress_callback=progress)
                 self.root.after(0, lambda: self._on_image_processed(img, result, file_path))
             except Exception as e:
@@ -531,7 +511,6 @@ class CaliperApp:
 
         self.btn_save.config(state=tk.NORMAL, bg=self.accent_color, fg="#1e1e2e")
         self.btn_open.config(state=tk.NORMAL)
-        self.chk_skip_ocr.config(state=tk.NORMAL)
         self._is_processing = False
 
         self.status_label.config(
@@ -545,7 +524,6 @@ class CaliperApp:
         traceback.print_exc()
         messagebox.showerror("识别错误", f"识别过程中出现错误:\n{str(error)}")
         self.btn_open.config(state=tk.NORMAL)
-        self.chk_skip_ocr.config(state=tk.NORMAL)
         self._is_processing = False
         self.status_label.config(text="❌ 识别失败")
 
@@ -568,11 +546,6 @@ class CaliperApp:
             self.lbl_total.config(fg="#f38ba8")
 
         extra = result.extra_info
-        if isinstance(extra, dict) and extra.get('skip_ocr'):
-            self.lbl_ocr_engine.config(text="OCR: skipped (算法调试)", fg=self.warn_color)
-            self.lbl_ocr_result.config(text="OCR: --  (skipped)")
-            return
-
         # ── OCR 引擎状态 ──
         from caliper.ocr import get_ocr_reader_singleton
         reader = get_ocr_reader_singleton()
