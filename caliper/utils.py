@@ -47,6 +47,135 @@ def find_peaks_adaptive(signal: np.ndarray, min_dist: int = 3,
     return np.array(peaks, dtype=int)
 
 
+def detect_tick_xs_in_band(binary: np.ndarray,
+                           band_y1: int,
+                           band_y2: int,
+                           x1: int = 0,
+                           x2: int = None,
+                           min_dist: int = 3,
+                           threshold_factor: float = 0.3,
+                           dedupe_tol: float = 3.0) -> dict:
+    h, w = binary.shape[:2]
+    if x2 is None:
+        x2 = w
+    band_y1 = max(0, min(h - 1, int(band_y1)))
+    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
+    x1 = max(0, min(w - 1, int(x1)))
+    x2 = max(x1 + 1, min(w, int(x2)))
+
+    band = binary[band_y1:band_y2, x1:x2]
+    proj = np.sum(band > 0, axis=0).astype(float)
+    if proj.size == 0 or float(np.max(proj)) <= 0:
+        return {
+            'band': band,
+            'proj': proj,
+            'proj_norm': proj,
+            'smooth': proj,
+            'tick_xs_local': [],
+            'tick_xs_global': [],
+            'peaks': np.array([], dtype=int),
+            'threshold': 0.0,
+        }
+
+    proj_norm = proj / float(np.max(proj))
+    win = max(3, min(11, len(proj_norm) // 90))
+    if win % 2 == 0:
+        win += 1
+    smooth = np.convolve(proj_norm, np.ones(win, dtype=float) / win, mode='same')
+    peaks = find_peaks_adaptive(smooth, min_dist=min_dist,
+                                threshold_factor=threshold_factor)
+
+    mu = float(np.mean(smooth))
+    sigma = float(np.std(smooth))
+    threshold = max(0.04, mu + threshold_factor * sigma)
+    if len(peaks) > 0:
+        peak_threshold = max(0.04, float(np.percentile(smooth[peaks], 35)))
+        threshold = min(threshold, peak_threshold)
+
+    xs = _tick_xs_from_projection_segments(proj_norm, smooth, threshold, dedupe_tol)
+    peak_xs = [int(x) for x in peaks if smooth[int(x)] >= threshold]
+    if len(xs) < len(peak_xs):
+        xs = _dedupe_tick_xs_for_projection(xs + peak_xs, dedupe_tol)
+
+    return {
+        'band': band,
+        'proj': proj,
+        'proj_norm': proj_norm,
+        'smooth': smooth,
+        'tick_xs_local': xs,
+        'tick_xs_global': [x1 + int(x) for x in xs],
+        'peaks': peaks,
+        'threshold': threshold,
+        'band_y1': band_y1,
+        'band_y2': band_y2,
+        'x1': x1,
+        'x2': x2,
+    }
+
+
+def _tick_xs_from_projection_segments(proj_norm: np.ndarray,
+                                      smooth: np.ndarray,
+                                      threshold: float,
+                                      dedupe_tol: float) -> List[int]:
+    mask = smooth >= threshold
+    segments = []
+    start = None
+    for i, value in enumerate(mask.astype(bool)):
+        if value and start is None:
+            start = i
+        elif not value and start is not None:
+            segments.append((start, i))
+            start = None
+    if start is not None:
+        segments.append((start, len(mask)))
+
+    xs = []
+    for s, e in segments:
+        raw = proj_norm[s:e]
+        if raw.size == 0 or float(np.max(raw)) <= 0:
+            continue
+        raw_threshold = max(0.12, float(np.max(raw)) * 0.42)
+        raw_mask = raw >= raw_threshold
+        raw_segments = []
+        rs = None
+        for idx, value in enumerate(raw_mask.astype(bool)):
+            if value and rs is None:
+                rs = idx
+            elif not value and rs is not None:
+                raw_segments.append((rs, idx))
+                rs = None
+        if rs is not None:
+            raw_segments.append((rs, len(raw_mask)))
+        if not raw_segments:
+            raw_segments = [(0, len(raw))]
+
+        for rs, re in raw_segments:
+            local = raw[rs:re]
+            if local.size == 0:
+                continue
+            local_x = np.arange(rs, re, dtype=float)
+            total = float(np.sum(local))
+            if total > 1e-6:
+                x = s + int(round(float(np.sum(local_x * local) / total)))
+            else:
+                x = s + int(round((rs + re - 1) / 2.0))
+            xs.append(x)
+
+    return _dedupe_tick_xs_for_projection(xs, dedupe_tol)
+
+
+def _dedupe_tick_xs_for_projection(xs: List[int], tol: float) -> List[int]:
+    if not xs:
+        return []
+    groups = []
+    for x in sorted(int(v) for v in xs):
+        if not groups or x - groups[-1][-1] > tol:
+            groups.append([x])
+        else:
+            groups[-1].append(x)
+    return [int(round(float(np.median(group)))) for group in groups]
+
+
 def _tick_row_threshold(col: np.ndarray,
                         max_factor: float = 0.40,
                         single_stroke_cap: float = 0.80) -> float:

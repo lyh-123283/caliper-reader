@@ -18,7 +18,6 @@ def rectify_vernier_region(region: dict, color_region: np.ndarray = None) -> dic
             'angle': 0.0,
             'matrix': None,
             'inverse_matrix': None,
-            'vis': _empty_vis(),
         }
 
     color_gray = cv2.cvtColor(color_region, cv2.COLOR_BGR2GRAY) if color_region is not None else None
@@ -38,14 +37,12 @@ def rectify_vernier_region(region: dict, color_region: np.ndarray = None) -> dic
     cropped_region['is_body_crop'] = True
     cropped_region['body_x_range'] = (body_x1, body_x2)
 
-    vis = _make_crop_vis(body_source, cropped_gray, color_region, cropped_color, body_x1, body_x2)
     return {
         'region': cropped_region,
         'color': cropped_color,
         'angle': 0.0,
         'matrix': None,
         'inverse_matrix': None,
-        'vis': vis,
     }
 
 
@@ -75,8 +72,12 @@ def _find_vernier_body_x_range(img: np.ndarray) -> tuple:
     if grad[left_x] < 1.2:
         left_x = int(w * 0.24)
 
-    right_lo, right_hi = int(w * 0.60), int(w * 0.80)
-    right_x = int(w * 0.69)
+    min_width = int(w * 0.24)
+    max_width = int(w * 0.68)
+
+    right_lo = max(left_x + min_width, int(w * 0.55))
+    right_hi = min(w - 1, max(left_x + max_width, int(w * 0.95)))
+    right_x = min(w - 1, left_x + int(w * 0.45))
     if right_hi > right_lo:
         right_slice = grad[right_lo:right_hi]
         if right_slice.size:
@@ -84,8 +85,6 @@ def _find_vernier_body_x_range(img: np.ndarray) -> tuple:
             if grad[candidate] < -1.0:
                 right_x = candidate
 
-    min_width = int(w * 0.24)
-    max_width = int(w * 0.50)
     if right_x - left_x < min_width:
         right_x = left_x + min_width
     if right_x - left_x > max_width:
@@ -93,31 +92,3 @@ def _find_vernier_body_x_range(img: np.ndarray) -> tuple:
 
     pad = max(6, int(w * 0.006))
     return max(0, left_x - pad), min(w, right_x + pad)
-
-
-def _make_crop_vis(src_gray, cropped_gray, src_color, cropped_color, x1: int, x2: int) -> np.ndarray:
-    left = src_color.copy() if src_color is not None else cv2.cvtColor(src_gray, cv2.COLOR_GRAY2BGR)
-    right = cropped_color.copy() if cropped_color is not None else cv2.cvtColor(cropped_gray, cv2.COLOR_GRAY2BGR)
-
-    cv2.rectangle(left, (x1, 0), (max(x1, x2 - 1), left.shape[0] - 1), (0, 220, 255), 2)
-
-    h = max(left.shape[0], right.shape[0])
-    w_left = left.shape[1]
-    w_right = right.shape[1]
-    gap = 6
-    label_h = 24
-    vis = np.full((h + label_h, w_left + gap + w_right, 3), 30, dtype=np.uint8)
-    vis[:left.shape[0], :w_left] = left
-    vis[:right.shape[0], w_left + gap:w_left + gap + w_right] = right
-    cv2.putText(vis, "Vernier body crop", (6, h + 17),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
-    cv2.putText(vis, f"x={x1}:{x2}", (w_left + gap + 6, h + 17),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1)
-    return vis
-
-
-def _empty_vis() -> np.ndarray:
-    img = np.zeros((80, 240, 3), dtype=np.uint8)
-    cv2.putText(img, "No vernier image", (12, 44),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
-    return img

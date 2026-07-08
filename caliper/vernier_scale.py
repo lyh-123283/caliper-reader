@@ -2,165 +2,19 @@
 步骤 4 — 游标尺识别（刻度线检测 + 固定 0.02mm 精度 + 对齐查找）
 
 流程:
-  1. 垂直投影 → 游标刻度线检测
-  2. 固定使用 0.02mm 精度
-  3. 零线定位（最左侧刻线）
-  4. 网格法找最佳对齐线 → 小数读数
+  1. 水平投影得到游标刻线带
+  2. 垂直投影找两段大谷底，确定完整游标刻线窗口
+  3. 高于阈值的连续峰段作为刻线，第一条为零线
+  4. 固定使用 0.02mm 精度并查找最佳对齐线
 """
 
 import cv2
 import numpy as np
 from typing import List, Tuple
 
-from .utils import (
-    find_peaks_adaptive, extract_ticks_from_binary, draw_projection_plot,
-    refine_ticks_by_spacing, extract_ticks_from_anchor_band,
-)
+from .utils import draw_projection_plot
 from .config import config
 
-
-
-
-# ═══════════════════════════ 对齐查找 v2 ═══════════════════════════
-
-def _verify_zero_by_digit(region: dict, zero_x: float) -> bool:
-    """
-    验证候选零线位置附近是否存在数字 "0"。
-
-    物理依据：游标卡尺的 0 刻度线向下应穿过数字 "0"（印在游标尺面板下方）。
-    在候选零线的 x 位置附近截取游标尺下半部分数字区域，跑 OCR 看是否
-    能识别出 "0"。
-    """
-    img = region['image']
-    h, w = img.shape
-
-    # 数字区域：游标尺数字印在刻线下方（靠近游标尺底边），取下半部分
-    y_start = int(h * config.vernier_scale.zero_digit_search_ratio)
-
-    # 以 zero_x 为中心取搜索窗口
-    half_w = max(config.vernier_scale.zero_digit_half_w_min,
-                 int(w * config.vernier_scale.zero_digit_half_w_ratio))
-    x1 = max(0, int(zero_x) - half_w)
-    x2 = min(w, int(zero_x) + half_w)
-
-    if x2 - x1 < 10:
-        return False
-
-    patch = img[y_start:, x1:x2]
-    if patch.size == 0:
-        return False
-
-    # 增强处理：放大 + CLAHE + 二值化
-    patch = cv2.resize(patch, (patch.shape[1] * 2, patch.shape[0] * 2),
-                       interpolation=cv2.INTER_CUBIC)
-    clahe = cv2.createCLAHE(clipLimit=config.vernier_scale.zero_digit_clahe_clip, tileGridSize=(4, 4))
-    patch = clahe.apply(patch)
-    _, patch_bin = cv2.threshold(patch, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 用现有 OCR 引擎识别
-    from .ocr import get_ocr_reader_singleton
-    reader = get_ocr_reader_singleton()
-    reader._ensure_engine()
-    results = reader._ocr_single_patch(patch_bin)
-
-    for text, conf in results:
-        if text == '0' and conf > config.vernier_scale.zero_digit_conf_min:
-            return True
-    return False
-
-
-def _find_zero_tick(vernier_ticks: List[dict], region: dict = None):
-    """
-    从游标刻线列表中定位零线（物理上=最左侧那条有效刻线）。
-
-    v6 改进：
-      1) 长度过滤 — 候选 tick 长度需 ≥ 中位数 × factor
-      2) 位置约束 — zero_x 必须 ≥ ROI 宽度 × 5%（避免选到 ROI 最左缘伪影）
-      3) 面板检测 — 候选 tick 下方 30% 区域灰度均值需偏暗（游标尺金属面板）
-      4) 数字验证 — 零线向下应穿过数字 "0"；OCR 确认则增强可信度
-
-    优先级：满足 1+2+3+4 → 满足 1+2+3 → 兜底回退首条
-
-    Returns:
-        (zero_tick, zero_digit_found)
-    """
-    if not vernier_ticks:
-        return None, False
-    v_sorted = sorted(vernier_ticks, key=lambda t: t['x'])
-    lengths = [t.get('length', 0) for t in v_sorted]
-    median_len = float(np.median(lengths)) if lengths else 0
-
-    # ── 位置下限：游标尺零线一定不会贴 ROI 最左边 ──
-    # v6: 提高到 17% 防止主尺残余刻线/DELIXI Logo 区域被当成零线
-    img_w = region['image'].shape[1] if region is not None and 'image' in region else 0
-    min_x = max(80, int(img_w * 0.17))
-
-    # ── 第一轮：满足长度 + 位置 + 面板 + 数字 0 验证 ──
-    if region is not None:
-        for t in v_sorted:
-            if t['x'] < min_x:
-                continue
-            length = t.get('length', 0)
-            if length < median_len * config.vernier_scale.zero_length_factor and len(v_sorted) > 3:
-                continue
-            if not _has_dark_panel_below(region, t['x']):
-                continue
-            if _verify_zero_by_digit(region, t['x']):
-                return t, True
-
-    # ── 第二轮：满足长度 + 位置 + 面板（无 OCR 验证）──
-    if region is not None:
-        for t in v_sorted:
-            if t['x'] < min_x:
-                continue
-            length = t.get('length', 0)
-            if length < median_len * config.vernier_scale.zero_length_factor and len(v_sorted) > 3:
-                continue
-            if _has_dark_panel_below(region, t['x']):
-                return t, False
-
-    # ── 第三轮：放宽到只看长度 + 位置 ──
-    for t in v_sorted:
-        if t['x'] < min_x:
-            continue
-        length = t.get('length', 0)
-        if length >= median_len * config.vernier_scale.zero_length_factor or len(v_sorted) <= 3:
-            return t, False
-
-    # ── 兜底 ──
-    return v_sorted[0], False
-
-
-def _has_dark_panel_below(region: dict, x_pos: float) -> bool:
-    """
-    判断候选零线 x 位置下方是否为游标尺金属面板（深色连续区）。
-
-    物理依据：真正的游标尺零线下方紧邻游标尺金属体（深色块），
-    而主尺溢出的伪刻线下方通常是亮金属面或背景。
-
-    采样：在 [x-3, x+3] × [h*0.30, h*0.70] 范围取灰度均值；
-    判定：均值 < 全 region 灰度均值 × 0.85 → 是面板。
-    """
-    if region is None or 'image' not in region:
-        return True  # 无 region 信息时不阻塞
-    img = region['image']
-    h, w = img.shape[:2]
-    x = int(round(x_pos))
-    if x < 3 or x >= w - 3:
-        return False
-
-    y1 = max(0, int(h * 0.30))
-    y2 = min(h - 1, int(h * 0.70))
-    if y2 <= y1:
-        return True
-    patch = img[y1:y2 + 1, max(0, x - 3):min(w, x + 4)]
-    if patch.size == 0:
-        return False
-
-    patch_mean = float(np.mean(patch))
-    global_mean = float(np.mean(img))
-    return patch_mean < global_mean * 0.85
 
 def find_best_alignment(vernier_ticks: List[dict],
                          precision: float,
@@ -182,7 +36,7 @@ def find_best_alignment(vernier_ticks: List[dict],
     """
     v_sorted = sorted(vernier_ticks, key=lambda t: t['x'])
     n_all = len(v_sorted)
-    expected_lines = int(round(1.0 / precision)) + 1 if precision and precision > 0 else n_all
+    expected_lines = int(round(1.0 / precision)) if precision and precision > 0 else n_all
     n = min(n_all, max(2, expected_lines))
     v_sorted = v_sorted[:n]
     if n < 2:
@@ -294,11 +148,10 @@ def _draw_vernier_ticks(region: dict,
                          vproj: np.ndarray,
                          peaks: np.ndarray,
                          zero_x: float = 0,
-                         zero_digit_found: bool = False,
                          band_detection: dict = None) -> np.ndarray:
     if band_detection:
         return _draw_vernier_ticks_on_band(
-            region, vernier_ticks, zero_x, zero_digit_found, band_detection
+            region, vernier_ticks, zero_x, band_detection
         )
 
     """绘制游标尺刻度线检测 — 灰度底图 + 右下角二值图小窗"""
@@ -320,16 +173,6 @@ def _draw_vernier_ticks(region: dict,
     cv2.line(vis, (zx, 0), (zx, h - 1), (50, 150, 255), 3)
     cv2.putText(vis, "ZERO", (zx + 4, 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (50, 150, 255), 1)
-
-    # ── 零线数字0验证状态提示 ──
-    if zero_digit_found:
-        status_text = "Zero Digit [0]: FOUND (OCR verified)"
-        status_color = (0, 220, 100)
-    else:
-        status_text = "Zero Digit [0]: NOT FOUND (fallback by position)"
-        status_color = (100, 180, 255)
-    cv2.putText(vis, status_text, (5, h - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, status_color, 1)
 
     # ── 右下角二值图小窗（显示检测器实际看到的图像）──
     bnw = max(50, w // 4)
@@ -362,7 +205,6 @@ def _draw_vernier_ticks(region: dict,
 def _draw_vernier_ticks_on_band(region: dict,
                                 vernier_ticks: List[dict],
                                 zero_x: float,
-                                zero_digit_found: bool,
                                 band_detection: dict) -> np.ndarray:
     """Draw vernier tick labels on the same narrow band used for detection."""
     img = region['image']
@@ -407,8 +249,7 @@ def _draw_vernier_ticks_on_band(region: dict,
         cv2.putText(vis, "ZERO", (min(zx + 4, band_w - 60), 24),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 150, 255), 2)
 
-    status_text = "Zero Digit [0]: FOUND" if zero_digit_found else "Zero from band sequence"
-    cv2.putText(vis, status_text, (5, disp_h - 8),
+    cv2.putText(vis, "Zero = first tick in valley-bounded band", (5, disp_h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (100, 180, 255), 1)
     cv2.putText(vis, "STEP 4: Vernier ticks on detected narrow band", (5, 18),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1)
@@ -529,8 +370,8 @@ def _empty_vernier_result() -> dict:
     return {
         'vernier_ticks': [], 'precision': 0.02, 'vernier_reading': 0.0,
         'zero_x': 0.0, 'aligned_tick': None,
-        'vis_ticks': empty_img, 'vis_alignment': empty_img, 'vis_digits': empty_img,
-        'vproj_norm': None, 'vernier_peaks': None, 'zero_digit_found': False,
+        'vis_ticks': empty_img, 'vis_alignment': empty_img,
+        'vproj_norm': None, 'vernier_peaks': None,
     }
 
 
@@ -578,148 +419,6 @@ def _find_vernier_body_x_range(img: np.ndarray) -> tuple:
 
     pad = max(6, int(w * 0.006))
     return max(0, left_x - pad), min(w, right_x + pad)
-
-
-def _filter_vernier_ticks_by_grid(vernier_ticks: List[dict], main_gap: float) -> List[dict]:
-    """Keep the longest stable vernier grid for fixed 0.02 mm calipers."""
-    if not vernier_ticks or len(vernier_ticks) < 4 or main_gap <= 0:
-        return vernier_ticks
-
-    expected = main_gap * 0.98
-    if expected < 3:
-        return vernier_ticks
-
-    ticks = sorted(vernier_ticks, key=lambda t: t['x'])
-
-    deduped = []
-    dup_tol = max(3.0, expected * 0.60)
-    for t in ticks:
-        if deduped and t['x'] - deduped[-1]['x'] < dup_tol:
-            if _tick_grid_priority(t) > _tick_grid_priority(deduped[-1]):
-                deduped[-1] = t
-        else:
-            deduped.append(t)
-
-    if len(deduped) < 4:
-        return vernier_ticks
-
-    best = []
-    tol = max(3.0, expected * 0.35)
-    for start_idx, start_tick in enumerate(deduped):
-        seq = [start_tick]
-        current_x = float(start_tick['x'])
-        for _ in range(1, 60):
-            target = current_x + expected
-            candidates = [t for t in deduped
-                          if target - tol <= t['x'] <= target + tol
-                          and t['x'] > current_x + expected * 0.45]
-            if not candidates:
-                break
-            nxt = min(candidates, key=lambda t: (
-                abs(t['x'] - target),
-                -_tick_grid_priority(t)[0],
-                -_tick_grid_priority(t)[1],
-            ))
-            if nxt in seq:
-                break
-            seq.append(nxt)
-            current_x = float(nxt['x'])
-
-        if len(seq) > len(best):
-            best = seq
-
-    median_len = float(np.median([t.get('length', 0) for t in deduped])) if deduped else 0.0
-    min_start_len = median_len * 0.70
-    min_initial = 5
-    min_total = max(12, config.vernier_scale.min_tick_count)
-    for start_tick in deduped:
-        if start_tick.get('length', 0) < min_start_len:
-            continue
-        seq = _collect_vernier_grid_sequence(deduped, start_tick, expected, tol)
-        if len(seq) < min_total:
-            continue
-        if _initial_grid_streak(seq, expected, tol) >= min_initial:
-            return sorted(seq, key=lambda t: t['x'])
-
-    if len(best) >= max(6, config.vernier_scale.min_tick_count):
-        return sorted(best, key=lambda t: t['x'])
-    return vernier_ticks
-
-
-def _collect_vernier_grid_sequence(ticks: List[dict],
-                                   start_tick: dict,
-                                   expected: float,
-                                   tol: float) -> List[dict]:
-    seq = [start_tick]
-    used = {id(start_tick)}
-    start_x = float(start_tick['x'])
-    prev_x = start_x
-    for k in range(1, 60):
-        target = start_x + expected * k
-        candidates = [
-            t for t in ticks
-            if id(t) not in used
-            and abs(float(t['x']) - target) <= tol
-            and float(t['x']) > prev_x + expected * 0.35
-        ]
-        if not candidates:
-            continue
-        nxt = min(candidates, key=lambda t: (
-            abs(float(t['x']) - target),
-            -_tick_grid_priority(t)[0],
-            -_tick_grid_priority(t)[1],
-        ))
-        seq.append(nxt)
-        used.add(id(nxt))
-        prev_x = float(nxt['x'])
-    return sorted(seq, key=lambda t: t['x'])
-
-
-def _initial_grid_streak(seq: List[dict], expected: float, tol: float) -> int:
-    if not seq:
-        return 0
-    xs = [float(t['x']) for t in sorted(seq, key=lambda item: item['x'])]
-    start_x = xs[0]
-    streak = 0
-    for k in range(0, 20):
-        target = start_x + expected * k
-        if any(abs(x - target) <= tol for x in xs):
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def _sync_band_detection_ticks(band_detection: dict, vernier_ticks: List[dict]) -> dict:
-    if not band_detection or not vernier_ticks:
-        return band_detection
-
-    x1 = int(band_detection.get('x1', 0))
-    band = band_detection.get('band')
-    band_w = band.shape[1] if band is not None and band.size else None
-    local_xs = []
-    global_xs = []
-    for t in sorted(vernier_ticks, key=lambda item: item['x']):
-        gx = int(round(t['x']))
-        lx = gx - x1
-        if band_w is not None and (lx < 0 or lx >= band_w):
-            continue
-        local_xs.append(lx)
-        global_xs.append(gx)
-
-    if len(local_xs) >= config.vernier_scale.min_tick_count:
-        band_detection['tick_xs_local'] = local_xs
-        band_detection['tick_xs_global'] = global_xs
-    return band_detection
-
-
-def _tick_grid_priority(tick: dict) -> tuple:
-    source_score = {
-        'band_projection_refined': 3,
-        'anchor_band': 2,
-        'projection': 1,
-    }.get(tick.get('source', 'projection'), 1)
-    return source_score, tick.get('length', 0)
 
 
 def _map_tick_to_original(tick: dict) -> dict:
@@ -960,18 +659,23 @@ def _tick_xs_from_projection_segments(proj_norm: np.ndarray,
 
 
 def _detect_vernier_band_projection(binary: np.ndarray,
-                                    body_x1: int,
-                                    body_x2: int,
-                                    main_gap: float,
-                                    gray: np.ndarray = None) -> dict:
-    """Detect vernier tick x positions once from the narrow band below seam."""
+                                     body_x1: int,
+                                     body_x2: int,
+                                     main_gap: float,
+                                     gray: np.ndarray = None,
+                                     tick_band: tuple = None) -> dict:
+    """Detect vernier ticks from the complete horizontal tick band."""
     if binary is None or binary.size == 0:
         return None
 
     h, w = binary.shape[:2]
-    x1 = max(0, min(w - 1, int(body_x1)))
-    x2 = max(x1 + 1, min(w, int(body_x2)))
-    band_y1, band_y2 = _find_vernier_tick_band(binary, x1, x2)
+    x1 = 0
+    x2 = w
+    if tick_band is not None:
+        band_y1 = max(0, min(h - 1, int(tick_band[0])))
+        band_y2 = max(band_y1 + 1, min(h, int(tick_band[1])))
+    else:
+        band_y1, band_y2 = _find_vernier_tick_band(binary, x1, x2)
     band = binary[band_y1:band_y2, x1:x2]
     if band.size == 0:
         return None
@@ -981,62 +685,35 @@ def _detect_vernier_band_projection(binary: np.ndarray,
         return None
 
     proj_norm = proj / np.max(proj)
-    win = max(3, min(11, len(proj_norm) // 80))
-    if win % 2 == 0:
-        win += 1
-    smooth = np.convolve(proj_norm, np.ones(win, dtype=float) / win, mode='same')
-    n = len(smooth)
-    min_dist = max(3, n // 200)
-
-    peaks = []
-    valleys = []
-    for i in range(min_dist, n - min_dist):
-        left = smooth[i - min_dist:i]
-        right = smooth[i + 1:i + min_dist + 1]
-        if smooth[i] > max(float(np.max(left)), float(np.max(right))):
-            peaks.append((i, float(smooth[i])))
-        if smooth[i] < min(float(np.min(left)), float(np.min(right))):
-            valleys.append((i, float(smooth[i])))
-
-    if len(peaks) < 3:
-        return None
-
-    peak_vals = sorted([v for _, v in peaks], reverse=True)
-    top80_n = max(1, int(len(peak_vals) * 0.8))
-    A = float(np.median(peak_vals[:top80_n]))
-
-    B = 0.0
-    if valleys:
-        valley_vals = sorted([v for _, v in valleys])
-        top80_nv = max(1, int(len(valley_vals) * 0.8))
-        B = float(np.median(valley_vals[:top80_nv]))
-    h_th = (A + B) / 2.0
-
     expected_gap = _estimate_vernier_tick_gap([], main_gap)
-    dedupe_tol = max(3.0, expected_gap * 0.35) if expected_gap > 0 else 3.0
-    peak_tick_xs = _dedupe_tick_xs([x for x, v in peaks if v >= h_th], dedupe_tol)
-    segment_tick_xs = _tick_xs_from_projection_segments(
-        proj_norm, smooth, h_th, dedupe_tol
-    )
-    raw_tick_xs = segment_tick_xs if len(segment_tick_xs) >= 3 else peak_tick_xs
-    if expected_gap <= 0:
-        expected_gap = _estimate_vernier_tick_gap(raw_tick_xs, main_gap)
-    if len(raw_tick_xs) < 3 or expected_gap <= 2.0:
+    if expected_gap <= 2.0:
+        expected_gap = _estimate_vernier_tick_gap([], 25.0)
+
+    smooth = _smooth_projection_1d(proj_norm, expected_gap)
+    valley_info = _select_vernier_roi_from_valleys(smooth, proj_norm, expected_gap)
+    if valley_info is None:
         return None
 
-    face_left_x = _find_vernier_face_left_edge(gray, band_y1, band_y2, x1, x2, expected_gap)
-    ignore_until = int(round(face_left_x + expected_gap * 0.55)) if face_left_x > 0 else int(round(expected_gap * 0.75))
-    early_filter_until = int(round(ignore_until + expected_gap * 3.0))
-    tick_xs = []
-    for x in raw_tick_xs:
-        if x < ignore_until:
-            continue
-        if x < early_filter_until and not _has_top_connected_vernier_stroke(band, x):
-            continue
-        tick_xs.append(x)
-    if len(tick_xs) < 3:
-        tick_xs = raw_tick_xs
-        ignore_until = 0
+    roi_x1, roi_x2 = valley_info['tick_roi']
+    h_th = float(valley_info.get('tick_h_th', _projection_segment_threshold(proj_norm[roi_x1:roi_x2], 0.80)))
+    tick_xs = list(valley_info.get('candidate_tick_xs') or [])
+    if not tick_xs:
+        tick_xs = _threshold_segments_from_projection(proj_norm, h_th, roi_x1, roi_x2)
+    if len(tick_xs) < config.vernier_scale.min_tick_count:
+        return None
+
+    valley_segments = valley_info['valley_segments']
+    valleys = [
+        (int(round((s + e) / 2.0)), float(np.min(smooth[max(0, s):min(len(smooth), e)])))
+        for s, e in valley_segments
+        if e > s
+    ]
+    peaks = [(int(x), float(proj_norm[int(x)])) for x in tick_xs if 0 <= int(x) < len(proj_norm)]
+    A = float(np.percentile(proj_norm, 90))
+    B = float(valley_info['valley_th'])
+    face_left_x = int(valley_segments[0][0]) if valley_segments else 0
+    ignore_until = int(valley_segments[0][1]) if valley_segments else 0
+    early_filter_until = ignore_until
 
     return {
         'x1': x1,
@@ -1049,9 +726,9 @@ def _detect_vernier_band_projection(binary: np.ndarray,
         'smooth': smooth,
         'peaks': peaks,
         'valleys': valleys,
-        'peak_tick_xs_local': peak_tick_xs,
-        'segment_tick_xs_local': segment_tick_xs,
-        'raw_tick_xs_local': raw_tick_xs,
+        'peak_tick_xs_local': tick_xs,
+        'segment_tick_xs_local': tick_xs,
+        'raw_tick_xs_local': tick_xs,
         'tick_xs_local': tick_xs,
         'tick_xs_global': [x1 + x for x in tick_xs],
         'h_th': h_th,
@@ -1061,7 +738,117 @@ def _detect_vernier_band_projection(binary: np.ndarray,
         'face_left_x': face_left_x,
         'ignore_until': ignore_until,
         'early_filter_until': early_filter_until,
+        'valley_segments': valley_segments,
+        'selected_valley_pair': valley_info['selected_pair'],
+        'all_valley_segments': valley_info['all_valley_segments'],
+        'vernier_tick_roi': (int(roi_x1), int(roi_x2)),
     }
+
+
+def _smooth_projection_1d(signal: np.ndarray, expected_gap: float) -> np.ndarray:
+    if signal is None or len(signal) == 0:
+        return np.asarray([], dtype=float)
+    win = int(round(expected_gap * 0.25)) if expected_gap > 2.0 else 5
+    win = max(3, min(21, win))
+    if win % 2 == 0:
+        win += 1
+    if win >= len(signal):
+        win = max(3, len(signal) | 1)
+    return np.convolve(signal, np.ones(win, dtype=float) / win, mode='same')
+
+
+def _valley_threshold(signal: np.ndarray) -> float:
+    if signal is None or len(signal) == 0:
+        return 0.08
+    median_v = float(np.median(signal))
+    return min(0.24, max(0.08, median_v * 0.95))
+
+
+def _merge_close_segments(segments: List[Tuple[int, int]], max_gap: int) -> List[Tuple[int, int]]:
+    if not segments:
+        return []
+    merged = [segments[0]]
+    for s, e in segments[1:]:
+        ps, pe = merged[-1]
+        if s - pe <= max_gap:
+            merged[-1] = (ps, e)
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _select_vernier_roi_from_valleys(signal: np.ndarray,
+                                     proj_norm: np.ndarray,
+                                     expected_gap: float):
+    if signal is None or len(signal) == 0 or expected_gap <= 2.0:
+        return None
+    valley_th = _valley_threshold(signal)
+    min_len = max(12, int(round(expected_gap * 0.80)))
+    merge_gap = max(4, int(round(expected_gap * 0.25)))
+    valley_segments = _contiguous_true_segments(signal <= valley_th, min_len=1)
+    valley_segments = _merge_close_segments(valley_segments, merge_gap)
+    valley_segments = [(s, e) for s, e in valley_segments if e - s >= min_len]
+    if len(valley_segments) < 2:
+        return None
+
+    min_middle = max(int(round(expected_gap * 35.0)), int(round(len(signal) * 0.18)))
+    max_middle = int(round(expected_gap * 62.0))
+    min_ticks = max(35, config.vernier_scale.min_tick_count)
+    max_ticks = 65
+    for i, left in enumerate(valley_segments[:-1]):
+        for right in valley_segments[i + 1:]:
+            middle = right[0] - left[1]
+            if middle < min_middle or middle > max_middle:
+                continue
+            h_th = _projection_segment_threshold(proj_norm[left[1]:right[0]], 0.80)
+            tick_xs = _threshold_segments_from_projection(proj_norm, h_th, left[1], right[0])
+            if not tick_xs or len(tick_xs) < min_ticks or len(tick_xs) > max_ticks:
+                continue
+            roi_x1 = int(left[1])
+            roi_x2 = int(right[0])
+            return {
+                'tick_roi': (roi_x1, roi_x2),
+                'selected_pair': (left, right, int(middle)),
+                'valley_segments': [left, right],
+                'all_valley_segments': valley_segments,
+                'valley_th': valley_th,
+                'tick_h_th': h_th,
+                'candidate_tick_xs': tick_xs,
+            }
+    return None
+
+
+def _projection_segment_threshold(signal: np.ndarray,
+                                  threshold_factor: float = 0.20) -> float:
+    if signal is None or len(signal) == 0:
+        return 0.02
+    return max(
+        float(np.mean(signal)) + threshold_factor * float(np.std(signal)),
+        0.02,
+    )
+
+
+def _threshold_segments_from_projection(signal: np.ndarray,
+                                        threshold: float,
+                                        x1: int = 0,
+                                        x2: int = None) -> List[int]:
+    if signal is None or len(signal) == 0:
+        return []
+    n = len(signal)
+    x1 = max(0, min(n, int(x1)))
+    x2 = n if x2 is None else max(x1, min(n, int(x2)))
+    mask = np.asarray(signal[x1:x2]) > float(threshold)
+    xs = []
+    start = None
+    for i, value in enumerate(mask.astype(bool)):
+        if value and start is None:
+            start = i
+        elif not value and start is not None:
+            xs.append(int(round((x1 + start + x1 + i - 1) / 2.0)))
+            start = None
+    if start is not None:
+        xs.append(int(round((x1 + start + x2 - 1) / 2.0)))
+    return xs
 
 
 def _build_ticks_from_band_detection(band_detection: dict,
@@ -1237,30 +1024,6 @@ def _contiguous_int_segments(xs: np.ndarray) -> List[tuple]:
     return segments
 
 
-def _count_right_grid_hits(start_x: float,
-                           tick_xs: List[int],
-                           expected_gap: float,
-                           tol: float) -> int:
-    if expected_gap <= 0 or not tick_xs:
-        return 0
-    xs = np.array(sorted(float(x) for x in tick_xs), dtype=float)
-    max_x = float(xs[-1])
-    hits = 0
-    misses = 0
-    for k in range(1, 55):
-        target = float(start_x) + expected_gap * k
-        if target > max_x + tol:
-            break
-        if np.min(np.abs(xs - target)) <= tol:
-            hits += 1
-            misses = 0
-        else:
-            misses += 1
-            if misses >= 3 and k >= 6:
-                break
-    return hits
-
-
 def _find_corresponding_mapped_tick(corrected_tick: dict,
                                     corrected_ticks: List[dict],
                                     mapped_ticks: List[dict]) -> dict:
@@ -1361,7 +1124,7 @@ def _find_zero_from_band_detection(vernier_ticks: List[dict],
                                    band_detection: dict):
     """Locate vernier zero from the already computed narrow-band ticks."""
     if not band_detection or not vernier_ticks:
-        return None, False, None
+        return None, None
 
     x1 = int(band_detection['x1'])
     x2 = int(band_detection['x2'])
@@ -1375,54 +1138,13 @@ def _find_zero_from_band_detection(vernier_ticks: List[dict],
     A = float(band_detection['A'])
     B = float(band_detection['B'])
     typical_gap = float(band_detection['expected_gap'])
-    face_left_x = int(band_detection.get('face_left_x', 0))
 
     if len(tick_xs) < 3 or typical_gap <= 2.0:
-        return None, False, None
+        return None, None
 
-    valley_candidates = []
-    fallback_sequence = []
-    tol = max(3.0, typical_gap * 0.35)
-    min_hits = 5 if len(tick_xs) < 14 else 8
-    for idx, tx in enumerate(tick_xs):
-        prev_x = tick_xs[idx - 1] if idx > 0 else None
-        left_ref = prev_x if prev_x is not None else face_left_x
-        leading_gap = float(tx - left_ref) if left_ref and tx > left_ref else float(tx)
-
-        left_a = max(0, int(round(tx - typical_gap * 1.8)))
-        left_b = max(0, int(round(tx - typical_gap * 0.45)))
-        left_energy = float(np.mean(smooth[left_a:left_b])) if left_b > left_a else 0.0
-        first_after_face = (
-            idx == 0
-            and face_left_x > 0
-            and tx - face_left_x >= typical_gap * 0.55
-        )
-        blank_ok = (
-            tx >= typical_gap * 0.75
-            and (
-                first_after_face
-                or leading_gap >= typical_gap * 1.45
-                or left_energy <= h_th * 0.65
-            )
-        )
-
-        hits = _count_right_grid_hits(tx, tick_xs, typical_gap, tol)
-        record = (idx, leading_gap, left_ref or 0, tx, hits)
-        if hits >= min_hits:
-            fallback_sequence.append(record)
-        if blank_ok and hits >= min_hits:
-            valley_candidates.append(record)
-
-    if valley_candidates:
-        best_valley = valley_candidates[0]
-    elif fallback_sequence:
-        valley_candidates = fallback_sequence
-        best_valley = fallback_sequence[0]
-    else:
-        return None, False, None
-
-    zero_local_x = best_valley[3]
+    zero_local_x = int(tick_xs[0])
     zero_global_x = x1 + zero_local_x
+    tol = max(3.0, typical_gap * 0.35)
     ticks_in_range = [t for t in vernier_ticks if x1 - typical_gap <= t['x'] <= x2 + typical_gap]
     if ticks_in_range:
         nearest = min(ticks_in_range, key=lambda t: abs(t['x'] - zero_global_x))
@@ -1430,159 +1152,15 @@ def _find_zero_from_band_detection(vernier_ticks: List[dict],
     else:
         found_tick = {'x': zero_global_x}
 
-    vis = _make_valley_projection_vis(
-        band, proj_norm, smooth, peaks, valleys, tick_xs, x1,
-        h_th, A, B, typical_gap,
-        valley_candidates, best_valley, found_tick)
-    return found_tick, False, vis
-
-
-def _find_zero_from_projection_valley(binary: np.ndarray,
-                                      vernier_ticks: List[dict],
-                                      body_x1: int,
-                                      body_x2: int,
-                                      main_gap: float,
-                                      gray: np.ndarray = None,
-                                      band_detection: dict = None):
-    """投影谷底法定位零线（v7 重写）。
-
-    算法：
-      1. 游标区顶部 45% 二值图水平投影 → 归一化 + 平滑
-      2. 找平滑曲线上所有局部极大值（峰）和局部极小值（谷）
-      3. 取前 80% 最高的峰的中位数 A，前 80% 最深的谷绝对值的中位数 B
-      4. h = (A + B) / 2
-      5. 高于 h 的峰 = 游标刻度线位置
-      6. 相邻峰间距明显偏大的位置 → 谷底候选
-      7. 第一个谷底候选区右侧第一条峰 = 零线
-
-    Returns:
-        (zero_tick, zero_digit_found, vis_projection)
-    """
-    if binary is None or binary.size == 0 or not vernier_ticks:
-        return None, False, None
-    if band_detection is not None:
-        return _find_zero_from_band_detection(vernier_ticks, band_detection)
-
-    h, w = binary.shape[:2]
-    x1 = max(0, min(w - 1, int(body_x1)))
-    x2 = max(x1 + 1, min(w, int(body_x2)))
-    band_y1, band_y2 = _find_vernier_tick_band(binary, x1, x2)
-    band = binary[band_y1:band_y2, x1:x2]
-    if band.size == 0:
-        return None, False, None
-
-    proj = np.sum(band > 0, axis=0).astype(float)
-    if np.max(proj) <= 0:
-        return None, False, None
-
-    proj_norm = proj / np.max(proj)
-    win = max(3, min(11, len(proj_norm) // 80))
-    if win % 2 == 0:
-        win += 1
-    smooth = np.convolve(proj_norm, np.ones(win, dtype=float) / win, mode='same')
-    n = len(smooth)
-
-    # ── 1. 找局部极大值（峰）和局部极小值（谷）──
-    min_dist = max(3, n // 200)
-    peaks = []   # (x, value)
-    valleys = [] # (x, value)
-    for i in range(min_dist, n - min_dist):
-        left = smooth[i - min_dist:i]
-        right = smooth[i + 1:i + min_dist + 1]
-        if smooth[i] > max(float(np.max(left)), float(np.max(right))):
-            peaks.append((i, float(smooth[i])))
-        if smooth[i] < min(float(np.min(left)), float(np.min(right))):
-            valleys.append((i, float(smooth[i])))
-
-    if len(peaks) < 3:
-        return None, False, None
-
-    # ── 2. 前 80% 中位数：峰取最高 80% 的中位数 A，谷取最深 80% 的中位数 B ──
-    peak_vals = sorted([v for _, v in peaks], reverse=True)
-    top80_n = max(1, int(len(peak_vals) * 0.8))
-    A = float(np.median(peak_vals[:top80_n]))
-
-    B = 0.0
-    if valleys:
-        valley_vals = sorted([v for _, v in valleys])  # 升序，最小值在前
-        top80_nv = max(1, int(len(valley_vals) * 0.8))
-        B = float(np.median(valley_vals[:top80_nv]))
-
-    h_th = (A + B) / 2.0
-
-    # ── 3. 筛选高于 h_th 的峰 → 刻度线 x 坐标 ──
-    expected_gap = _estimate_vernier_tick_gap([], main_gap)
-    dedupe_tol = max(3.0, expected_gap * 0.35) if expected_gap > 0 else 3.0
-    tick_xs = _dedupe_tick_xs([x for x, v in peaks if v >= h_th], dedupe_tol)
-    if len(tick_xs) < 3:
-        return None, False, None
-
-    if expected_gap <= 0:
-        expected_gap = _estimate_vernier_tick_gap(tick_xs, main_gap)
-    if expected_gap <= 2.0:
-        return None, False, None
-
-    # ── 4. 相邻峰间距 → 找显著偏大的谷底候选 ──
-    diffs = np.diff(tick_xs)
-    if len(diffs) < 2:
-        return None, False, None
-
-    typical_gap = float(expected_gap)
-    if typical_gap < 2.0:
-        return None, False, None
-
-    # Find the first candidate after a blank lead-in, then require a stable
-    # vernier spacing sequence to the right. Projection still supplies the
-    # candidates, but it no longer decides zero only by a valley.
-    valley_candidates = []
-    fallback_sequence = []
-    tol = max(3.0, typical_gap * 0.35)
-    min_hits = 5 if len(tick_xs) < 14 else 8
-    for idx, tx in enumerate(tick_xs):
-        prev_x = tick_xs[idx - 1] if idx > 0 else None
-        leading_gap = float(tx if prev_x is None else tx - prev_x)
-
-        left_a = max(0, int(round(tx - typical_gap * 1.8)))
-        left_b = max(0, int(round(tx - typical_gap * 0.45)))
-        left_energy = float(np.mean(smooth[left_a:left_b])) if left_b > left_a else 0.0
-        blank_ok = (
-            tx >= typical_gap * 0.75
-            and (leading_gap >= typical_gap * 1.45 or left_energy <= h_th * 0.65)
-        )
-
-        hits = _count_right_grid_hits(tx, tick_xs, typical_gap, tol)
-        record = (idx, leading_gap, prev_x or 0, tx, hits)
-        if hits >= min_hits:
-            fallback_sequence.append(record)
-        if blank_ok and hits >= min_hits:
-            valley_candidates.append(record)
-
-    if valley_candidates:
-        best_valley = valley_candidates[0]
-    elif fallback_sequence:
-        valley_candidates = fallback_sequence
-        best_valley = fallback_sequence[0]
-    else:
-        return None, False, None
-
-    # ── 5. 第一个谷底候选区右侧第一条峰 = 零线 ──
-    zero_local_x = best_valley[3]
-    zero_global_x = x1 + zero_local_x
-
-    # 在 vernier_ticks 中找最接近 zero_global_x 的 tick
-    ticks_in_range = [t for t in vernier_ticks if x1 - typical_gap <= t['x'] <= x2 + typical_gap]
-    if ticks_in_range:
-        nearest = min(ticks_in_range, key=lambda t: abs(t['x'] - zero_global_x))
-        found_tick = nearest if abs(nearest['x'] - zero_global_x) <= tol else {'x': zero_global_x}
-    else:
-        found_tick = {'x': zero_global_x}
+    roi_x1, roi_x2 = band_detection.get('vernier_tick_roi', (tick_xs[0], tick_xs[-1]))
+    valley_candidates = [(0, float(roi_x2 - roi_x1), int(roi_x1), int(roi_x2), len(tick_xs))]
+    best_valley = valley_candidates[0]
 
     vis = _make_valley_projection_vis(
         band, proj_norm, smooth, peaks, valleys, tick_xs, x1,
         h_th, A, B, typical_gap,
         valley_candidates, best_valley, found_tick)
-
-    return found_tick, False, vis
+    return found_tick, vis
 
 
 def _make_valley_projection_vis(band: np.ndarray,
@@ -1715,7 +1293,7 @@ def _make_valley_projection_vis(band: np.ndarray,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 170), 1)
 
     # 标题
-    cv2.putText(vis, "Zero-Line Detection (auto tick band + right grid check)", (margin, band_h + 22),
+    cv2.putText(vis, "Zero-Line Detection (valley pair + tick segments)", (margin, band_h + 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 220), 1)
 
     # 图例
@@ -1776,7 +1354,8 @@ def recognize_vernier_scale(region: dict,
         body_x1, body_x2 = _find_vernier_body_x_range(img)
 
     band_detection = _detect_vernier_band_projection(
-        binary, body_x1, body_x2, main_gap, img
+        binary, body_x1, body_x2, main_gap, img,
+        tick_band=region.get('tick_band')
     )
     vernier_xs = np.array(
         band_detection['tick_xs_global'] if band_detection else [],
@@ -1790,70 +1369,16 @@ def recognize_vernier_scale(region: dict,
         )
 
     if len(vernier_ticks) < config.vernier_scale.min_tick_count:
-        fallback_xs = find_peaks_adaptive(
-            vproj_norm,
-            min_dist=config.vernier_scale.peak_min_dist,
-            threshold_factor=config.vernier_scale.peak_threshold_factor,
-        )
-        if len(fallback_xs) >= config.vernier_scale.min_tick_count and config.vernier_scale.spacing_refine_enabled:
-            refined_xs = refine_ticks_by_spacing(
-                fallback_xs, binary,
-                spacing_tolerance=config.vernier_scale.spacing_tolerance,
-                gap_factor=config.vernier_scale.spacing_gap_factor,
-                dup_factor=config.vernier_scale.spacing_dup_factor,
-                snap_ratio=config.vernier_scale.spacing_snap_ratio,
-            )
-            if len(refined_xs) >= config.vernier_scale.min_tick_count:
-                fallback_xs = refined_xs
-        if len(fallback_xs) >= config.vernier_scale.min_tick_count:
-            vernier_ticks = extract_ticks_from_binary(
-                binary, fallback_xs,
-                min_length_ratio=0.04,
-                long_tick_factor=config.vernier_scale.long_tick_factor)
-            vernier_ticks.sort(key=lambda t: t['x'])
-
-        if len(vernier_ticks) < config.vernier_scale.min_tick_count:
-            work_binary = binary[:, body_x1:body_x2]
-            vernier_ticks = extract_ticks_from_anchor_band(
-                work_binary,
-                direction="down",
-                min_length_ratio=0.04,
-                band_ratio=0.45,
-                peak_min_dist=config.vernier_scale.peak_min_dist,
-                peak_threshold_factor=0.05,
-                long_tick_factor=config.vernier_scale.long_tick_factor,
-            )
-            for t in vernier_ticks:
-                t['x'] += body_x1
-            vernier_ticks.sort(key=lambda t: t['x'])
-        vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
-        if len(vernier_ticks) < config.vernier_scale.min_tick_count:
-            return _empty_vernier_result()
+        return _empty_vernier_result()
 
     precision = 0.02
-    grid_ticks = _filter_vernier_ticks_by_grid(vernier_ticks, main_gap)
-    if len(grid_ticks) >= config.vernier_scale.min_tick_count:
-        vernier_ticks = grid_ticks
-        band_detection = _sync_band_detection_ticks(band_detection, vernier_ticks)
     vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
     v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else 0.0
 
-    zero_tick, zero_digit_found, valley_vis = _find_zero_from_projection_valley(
-        binary, vernier_ticks, body_x1, body_x2, main_gap,
-        gray=img, band_detection=band_detection
+    zero_tick, valley_vis = _find_zero_from_band_detection(
+        vernier_ticks, band_detection
     )
-    if zero_tick is not None:
-        zero_x = float(zero_tick['x'])
-        clean_vernier = [t for t in vernier_ticks
-                         if t['x'] >= zero_x - max(v_gap, 1.0) * 0.4]
-        if len(clean_vernier) >= config.vernier_scale.min_tick_count:
-            vernier_ticks = sorted(clean_vernier, key=lambda t: t['x'])
-            vernier_xs = np.array([t['x'] for t in vernier_ticks], dtype=int)
-            v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else v_gap
-
-    if zero_tick is None:
-        zero_tick, zero_digit_found = _find_zero_tick(vernier_ticks, region)
-        zero_x = float(zero_tick['x']) if zero_tick else float(vernier_ticks[0]['x'])
+    zero_x = float(zero_tick['x']) if zero_tick else float(vernier_ticks[0]['x'])
 
     clean_vernier = [t for t in vernier_ticks if t['x'] >= zero_x - max(v_gap, 1.0) * 0.4]
     if len(clean_vernier) >= config.vernier_scale.min_tick_count:
@@ -1877,7 +1402,7 @@ def recognize_vernier_scale(region: dict,
 
     vis_ticks = _draw_vernier_ticks(
         region, binary, corrected_ticks, vproj_norm, vernier_xs,
-        zero_x_corrected, zero_digit_found, band_detection=band_detection
+        zero_x_corrected, band_detection=band_detection
     )
 
     vernier_reading, aligned_tick, align_conf = find_best_alignment(
@@ -1906,5 +1431,4 @@ def recognize_vernier_scale(region: dict,
         'vernier_peaks': vernier_xs,
         'vernier_band_detection': band_detection,
         'integer_snap': integer_snap,
-        'zero_digit_found': zero_digit_found,
     }

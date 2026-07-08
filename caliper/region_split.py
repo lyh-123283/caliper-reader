@@ -53,29 +53,43 @@ def split_scales(rotated_gray: np.ndarray,
     if h - split_y < min_vernier_h:
         split_y = h - min_vernier_h
 
+    band_info = _analyze_horizontal_tick_bands(rotated_gray, binary, split_y)
+    main_band = band_info.get('main_tick_band', (max(0, split_y - max(24, h // 3)), split_y))
+    vernier_band = band_info.get('vernier_tick_band', (split_y, min(h, split_y + max(24, h // 4))))
+
     # ── 切分 ──
     img_upper = rotated_gray[:split_y, :]
     img_lower = rotated_gray[split_y:, :]
     bin_upper = binary[:split_y, :]
     bin_lower = binary[split_y:, :]
 
+    main_band_local = (max(0, main_band[0]), min(split_y, main_band[1]))
+    vernier_band_local = (
+        max(0, vernier_band[0] - split_y),
+        min(h - split_y, vernier_band[1] - split_y),
+    )
     region_main = {
         'image': img_upper, 'binary': bin_upper,
         'y_offset': 0, 'height': split_y,
+        'tick_band': main_band_local,
+        'tick_band_global': main_band,
     }
     region_vernier = {
         'image': img_lower, 'binary': bin_lower,
         'y_offset': split_y, 'height': h - split_y,
+        'tick_band': vernier_band_local,
+        'tick_band_global': vernier_band,
     }
 
     split_vis = _make_split_vis(rotated_color if rotated_color is not None
                                   else rotated_gray,
-                                  rotated_gray, binary, split_y)
+                                  rotated_gray, binary, split_y, band_info)
 
     return {
         'region_main': region_main,
         'region_vernier': region_vernier,
         'split_y': split_y,
+        'tick_bands': band_info,
         'split_vis': split_vis,
     }
 
@@ -183,6 +197,190 @@ def _row_local_contrast(row: np.ndarray, lo: int, hi: int, radius: int) -> np.nd
         below = float(np.mean(row[b1:b2])) if b2 > b1 else float(row[y])
         out.append(abs(above - below))
     return _norm01(np.array(out, dtype=float))
+
+
+def _foreground_binary(binary: np.ndarray, gray: np.ndarray = None) -> np.ndarray:
+    if binary is None:
+        if gray is None:
+            return None
+        _, fg = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return fg
+    fg = binary.copy()
+    if float(np.mean(fg > 0)) > 0.5:
+        fg = cv2.bitwise_not(fg)
+    return fg
+
+
+def _analyze_horizontal_tick_bands(gray: np.ndarray,
+                                   binary: np.ndarray,
+                                   split_y: int) -> dict:
+    h, w = gray.shape[:2]
+    fg = _foreground_binary(binary, gray)
+    if fg is None or fg.size == 0:
+        return {
+            'main_tick_band': (max(0, split_y - max(24, h // 3)), split_y),
+            'vernier_tick_band': (split_y, min(h, split_y + max(24, h // 4))),
+        }
+
+    kernel_h = max(7, min(31, h // 18))
+    if kernel_h % 2 == 0:
+        kernel_h += 1
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+    vertical = cv2.morphologyEx(fg, cv2.MORPH_OPEN, vertical_kernel)
+    if np.count_nonzero(vertical) < max(20, fg.size * 0.0004):
+        vertical = fg
+
+    row_score = np.mean(vertical > 0, axis=1).astype(float)
+    row_coverage = _row_horizontal_coverage(vertical)
+    win = max(5, min(21, h // 45))
+    if win % 2 == 0:
+        win += 1
+    smooth = np.convolve(row_score, np.ones(win, dtype=float) / win, mode='same')
+    coverage_smooth = np.convolve(row_coverage, np.ones(win, dtype=float) / win, mode='same')
+
+    main_band = _find_tick_band_from_rows(
+        smooth, 0, split_y, 'main', h, coverage_smooth)
+    vernier_band = _find_tick_band_from_rows(
+        smooth, split_y, h, 'vernier', h, coverage_smooth)
+
+    if main_band is None:
+        main_band = (max(0, split_y - max(24, int(h * 0.28))), split_y)
+    if vernier_band is None:
+        vernier_band = (split_y, min(h, split_y + max(24, int(h * 0.22))))
+
+    return {
+        'main_tick_band': main_band,
+        'vernier_tick_band': vernier_band,
+        'row_projection': row_score,
+        'row_projection_smooth': smooth,
+        'row_coverage': row_coverage,
+        'row_coverage_smooth': coverage_smooth,
+        'vertical_binary': vertical,
+    }
+
+
+def _row_horizontal_coverage(binary: np.ndarray) -> np.ndarray:
+    h, w = binary.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.array([], dtype=float)
+    block_w = max(12, w // 120)
+    n_blocks = max(1, w // block_w)
+    trimmed = binary[:, :n_blocks * block_w] > 0
+    if trimmed.size == 0:
+        return np.zeros(h, dtype=float)
+    blocks = trimmed.reshape(h, n_blocks, block_w)
+    block_density = np.mean(blocks, axis=2)
+    return np.mean(block_density > 0.01, axis=1).astype(float)
+
+
+def _find_tick_band_from_rows(row_score: np.ndarray,
+                              lo: int,
+                              hi: int,
+                              side: str,
+                              full_h: int,
+                              row_coverage: np.ndarray = None):
+    lo = max(0, int(lo))
+    hi = min(len(row_score), int(hi))
+    if hi - lo < 8:
+        return None
+
+    values = row_score[lo:hi]
+    vmax = float(np.max(values)) if values.size else 0.0
+    if vmax <= 0:
+        return None
+
+    positive = values[values > 0]
+    base = float(np.percentile(positive, 62)) if positive.size else 0.0
+    th = max(base, vmax * 0.18)
+    min_len = max(7, min(30, int(full_h * 0.025)))
+    segments = _contiguous_segments_1d(values >= th, min_len=min_len)
+    if not segments:
+        th = vmax * 0.12
+        segments = _contiguous_segments_1d(values >= th, min_len=max(5, min_len // 2))
+    if not segments:
+        return None
+
+    scored = []
+    for s, e in segments:
+        gs, ge = lo + s, lo + e
+        length = max(1, ge - gs)
+        mean_score = float(np.mean(row_score[gs:ge]))
+        length_score = min(1.0, length / max(12.0, full_h * 0.18))
+        if side == 'main':
+            proximity = 1.0 - min(1.0, abs(hi - ge) / max(12.0, full_h * 0.30))
+        else:
+            proximity = 1.0 - min(1.0, abs(gs - lo) / max(12.0, full_h * 0.22))
+        score = 0.62 * (mean_score / vmax) + 0.23 * length_score + 0.15 * proximity
+        scored.append((score, gs, ge))
+
+    _, y1, y2 = max(scored, key=lambda item: item[0])
+    pad = max(3, min(12, full_h // 80))
+    y1 = max(lo, y1 - pad)
+    y2 = min(hi, y2 + pad)
+    min_h = max(12, min(48, int(full_h * 0.06)))
+    if y2 - y1 < min_h:
+        extra = min_h - (y2 - y1)
+        y1 = max(lo, y1 - extra // 2)
+        y2 = min(hi, y2 + extra - extra // 2)
+    if side == 'main':
+        y1 = _extend_main_band_to_long_ticks(row_score, row_coverage, y1, y2, lo, hi, vmax, full_h)
+    return int(y1), int(max(y1 + 1, y2))
+
+
+def _extend_main_band_to_long_ticks(row_score: np.ndarray,
+                                    row_coverage: np.ndarray,
+                                    y1: int,
+                                    y2: int,
+                                    lo: int,
+                                    hi: int,
+                                    vmax: float,
+                                    full_h: int) -> int:
+    if y2 <= y1 or vmax <= 0:
+        return y1
+    if row_coverage is None or len(row_coverage) != len(row_score):
+        row_coverage = np.ones_like(row_score, dtype=float)
+
+    search_lo = max(lo, hi - max(50, int(full_h * 0.45)))
+    positive = row_score[search_lo:y2][row_score[search_lo:y2] > 0]
+    if positive.size == 0:
+        return y1
+
+    low_th = max(vmax * 0.11, float(np.percentile(positive, 28)) * 0.75)
+    cov_positive = row_coverage[search_lo:y2][row_coverage[search_lo:y2] > 0]
+    cov_th = max(0.22, float(np.percentile(cov_positive, 45)) * 0.85) if cov_positive.size else 0.22
+    max_gap = max(8, min(28, int(full_h * 0.055)))
+    candidate = y1
+    gap = 0
+    seen = False
+
+    for y in range(y1 - 1, search_lo - 1, -1):
+        if float(row_score[y]) >= low_th and float(row_coverage[y]) >= cov_th:
+            candidate = y
+            gap = 0
+            seen = True
+        elif seen:
+            gap += 1
+            if gap > max_gap:
+                break
+
+    if y1 - candidate < max(6, int(full_h * 0.025)):
+        return y1
+    return max(lo, candidate - max(4, min(12, full_h // 45)))
+
+
+def _contiguous_segments_1d(mask: np.ndarray, min_len: int = 1):
+    segments = []
+    start = None
+    for idx, val in enumerate(mask.astype(bool)):
+        if val and start is None:
+            start = idx
+        elif not val and start is not None:
+            if idx - start >= min_len:
+                segments.append((start, idx))
+            start = None
+    if start is not None and len(mask) - start >= min_len:
+        segments.append((start, len(mask)))
+    return segments
 
 
 def _split_by_candidate_scan(gray: np.ndarray, binary: np.ndarray,
@@ -325,7 +523,8 @@ def _equispaced_coverage(zone_binary: np.ndarray, w: int):
 def _make_split_vis(color_bg: np.ndarray,   # BGR 彩色图（若不可用则为灰度）
                      gray: np.ndarray,
                      binary: np.ndarray,
-                     split_y: int) -> np.ndarray:
+                     split_y: int,
+                     band_info: dict = None) -> np.ndarray:
     """生成区域分离的可视化图：彩色原图+分割线 + 梯度投影图 + 闭运算投影图"""
     h, w = gray.shape
 
@@ -334,6 +533,24 @@ def _make_split_vis(color_bg: np.ndarray,   # BGR 彩色图（若不可用则为
         vis_gray = color_bg.copy()
     else:
         vis_gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    if band_info:
+        overlay = vis_gray.copy()
+        main_band = band_info.get('main_tick_band')
+        vernier_band = band_info.get('vernier_tick_band')
+        if main_band:
+            cv2.rectangle(overlay, (0, int(main_band[0])), (w - 1, int(main_band[1])),
+                          (0, 180, 80), -1)
+        if vernier_band:
+            cv2.rectangle(overlay, (0, int(vernier_band[0])), (w - 1, int(vernier_band[1])),
+                          (255, 160, 40), -1)
+        vis_gray = cv2.addWeighted(vis_gray, 0.82, overlay, 0.18, 0)
+        if main_band:
+            cv2.line(vis_gray, (0, int(main_band[0])), (w, int(main_band[0])), (0, 180, 80), 1)
+            cv2.line(vis_gray, (0, int(main_band[1])), (w, int(main_band[1])), (0, 180, 80), 1)
+        if vernier_band:
+            cv2.line(vis_gray, (0, int(vernier_band[0])), (w, int(vernier_band[0])), (255, 160, 40), 1)
+            cv2.line(vis_gray, (0, int(vernier_band[1])), (w, int(vernier_band[1])), (255, 160, 40), 1)
 
     cv2.line(vis_gray, (0, split_y), (w, split_y), (0, 255, 255), 2)
     cv2.putText(vis_gray, "MAIN SCALE", (10, split_y - 8),
@@ -357,14 +574,19 @@ def _make_split_vis(color_bg: np.ndarray,   # BGR 彩色图（若不可用则为
 
     # ── 下：二值图闭运算投影 ──
     if binary is not None:
-        kernel_w = max(w // 3, 30)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
-        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        hproj = np.sum(closed, axis=1).astype(float)
+        closed = band_info.get('vertical_binary') if band_info else None
+        if closed is None:
+            fg = _foreground_binary(binary, gray)
+            kernel_h = max(7, min(31, h // 18))
+            if kernel_h % 2 == 0:
+                kernel_h += 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
+            closed = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel)
+        hproj = np.sum(closed > 0, axis=1).astype(float)
         if np.max(hproj) > 0:
             hproj /= np.max(hproj)
         bin_plot = draw_projection_plot(hproj,
-                                         title=f"Binary-Close Projection (kernel={kernel_w}px)")
+                                         title="Horizontal Projection of Vertical Tick Pixels")
         if len(hproj) > 0:
             px2 = int(split_y * (bin_plot.shape[1] - 40) / len(hproj)) + 20
             cv2.line(bin_plot, (px2, 0), (px2, bin_plot.shape[0]),

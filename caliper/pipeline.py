@@ -15,11 +15,10 @@ import numpy as np
 
 from .result import CaliperResult
 from .preprocess import preprocess
-from .roi_extract import extract_roi, orient_caliper
+from .roi_extract import locate_roi_lowres, orient_caliper
 from .region_split import split_scales
 from .main_scale import recognize_main_scale
 from .vernier_scale import recognize_vernier_scale
-from .vernier_rectify import rectify_vernier_region
 from .merger import merge_readings
 from .utils import draw_legend_below, draw_projection_plot
 from .config import config
@@ -65,38 +64,29 @@ class CaliperPipeline:
         # ═══════════════════════════════════════
         #  步骤 0: 图像预处理
         # ═══════════════════════════════════════
-        pp = preprocess(img, **self.preprocess_params)
+        roi_result = locate_roi_lowres(img)
+        if roi_result['roi_color'] is None:
+            return self._fail(original, "ROI 提取失败")
+        self.debug_images['1a_ROI定位'] = roi_result.get('lowres_debug')
+        self._emit_progress(progress_callback, '1a_ROI定位', 'ROI 定位完成')
+
+        pp = preprocess(roi_result['roi_color'], **self.preprocess_params)
+        roi_result['roi_color'] = pp['color']
+        roi_result['roi_gray'] = pp['enhanced']
+        roi_result['roi_binary'] = pp['binary_adaptive']
         self.debug_images['0_预处理'] = pp['debug_vis']
         self.step_results['preprocess'] = pp
         self._emit_progress(progress_callback, '0_预处理', '预处理完成')
-
-        # ═══════════════════════════════════════
-        #  步骤 1: ROI提取 + 方向矫正
-        # ═══════════════════════════════════════
-        # 1a. ROI 提取（投影法，利用 enhanced 做灰度、binary 做投影定位）
-        roi_result = extract_roi(
-            pp['color'],
-            pp.get('roi_binary', pp['binary_adaptive']),
-            pp.get('roi_enhanced', pp['enhanced']),
-            crop_gray=pp['enhanced'],
-            crop_binary=pp['binary_adaptive'],
-        )
-        if roi_result['roi_color'] is None:
-            return self._fail(original, "ROI 提取失败")
-
-        self.debug_images['1a_ROI提取'] = roi_result['roi_color']
         self.step_results['roi'] = roi_result
-        self._emit_progress(progress_callback, '1a_ROI提取', 'ROI 提取完成')
 
-        # 1b. 方向矫正
         orient_result = orient_caliper(
             roi_result['roi_color'],
             roi_result['roi_gray'],
             roi_result['roi_binary']
         )
-        self.debug_images['1b_方向矫正'] = orient_result['orient_vis']
+        self.debug_images['1b_方向校正'] = orient_result['orient_vis']
         self.step_results['orient'] = orient_result
-        self._emit_progress(progress_callback, '1b_方向矫正', '方向矫正完成')
+        self._emit_progress(progress_callback, '1b_方向校正', '方向校正完成')
         return self._run_remainder(original, orient_result, progress_callback)
 
     def _run_remainder(self, original: np.ndarray,
@@ -120,16 +110,11 @@ class CaliperPipeline:
         main_color = rotated_color[:split_y, :]
         main_result = recognize_main_scale(region_main, main_color)
         self.debug_images['3a_主尺刻度线'] = main_result['vis_ticks']
-        self.debug_images['3b_主尺数字OCR'] = main_result['vis_digits']
         self.step_results['main'] = main_result
         self._emit_progress(progress_callback, '3a_主尺刻度线', '主尺刻线识别完成')
 
         # 步骤 4
         vernier_color = rotated_color[split_y:, :]
-        vernier_rectify = rectify_vernier_region(region_vernier, vernier_color)
-        self.step_results['vernier_rectify'] = vernier_rectify
-        region_vernier = vernier_rectify['region']
-        vernier_color = vernier_rectify['color']
         vernier_result = recognize_vernier_scale(
             region_vernier, main_result['main_gap'], vernier_color,
             main_result['main_ticks']
@@ -139,7 +124,6 @@ class CaliperPipeline:
                                         split_y, region_main, region_vernier)
         self.debug_images['3a_主尺刻度线'] = overview
         self._emit_progress(progress_callback, '3a_主尺刻度线', '零线总览完成')
-        self.debug_images['3b_主尺数字OCR'] = main_result['vis_digits']
         self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
         self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
         # ── 对齐可视化：用整张 ROI 图（含主尺真实网格）──

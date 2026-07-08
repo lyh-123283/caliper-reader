@@ -14,8 +14,7 @@ from typing import List, Tuple
 
 from .result import DigitInfo
 from .utils import (
-    find_peaks_adaptive, extract_ticks_from_binary, draw_projection_plot,
-    refine_ticks_by_spacing,
+    extract_ticks_from_binary, draw_projection_plot,
 )
 from .config import config
 
@@ -36,7 +35,6 @@ def recognize_main_scale(region: dict,
             'main_digits':  OCR 识别的数字列表
             'main_reading': 整数读数（暂用间距估算）
             'vis_ticks':    刻度线可视化
-            'vis_digits':   数字识别可视化
     """
     img = region['image']
     h, w = img.shape
@@ -55,36 +53,34 @@ def recognize_main_scale(region: dict,
                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     region['binary'] = binary
 
-    # ── 2. 垂直投影 → 峰值检测 ──
-    vproj = np.sum(binary, axis=0).astype(float)
+    band_y1, band_y2 = region.get('tick_band', (0, h))
+    band_y1 = max(0, min(h - 1, int(band_y1)))
+    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
+    vproj = np.sum(binary[band_y1:band_y2, :] > 0, axis=0).astype(float)
     if np.max(vproj) > 0:
         vproj_norm = vproj / np.max(vproj)
     else:
         vproj_norm = vproj
 
-    main_xs = find_peaks_adaptive(vproj_norm, min_dist=config.main_scale.peak_min_dist,
-                                   threshold_factor=config.main_scale.peak_threshold_factor)
+    main_xs = _find_threshold_segments(
+        vproj_norm,
+        threshold_factor=config.main_scale.peak_threshold_factor,
+    )
     if len(main_xs) < config.main_scale.min_tick_count:
         return _empty_main_result()
 
     # ── 2.5 等间距补全 & 校验 ──
-    if config.main_scale.spacing_refine_enabled:
-        refined_xs = refine_ticks_by_spacing(
-            main_xs, binary,
-            spacing_tolerance=config.main_scale.spacing_tolerance,
-            gap_factor=config.main_scale.spacing_gap_factor,
-            dup_factor=config.main_scale.spacing_dup_factor,
-            snap_ratio=config.main_scale.spacing_snap_ratio,
-        )
-        if len(refined_xs) >= config.main_scale.min_tick_count:
-            main_xs = refined_xs
-
     # ── 3. 精密提取刻线 ──
+    tick_band_binary = binary[band_y1:band_y2, :]
     main_ticks = extract_ticks_from_binary(
-        binary, main_xs,
+        tick_band_binary, main_xs,
         long_tick_factor=config.main_scale.long_tick_factor)
     if len(main_ticks) < config.main_scale.min_tick_count:
         return _empty_main_result()
+    for tick in main_ticks:
+        tick['y_start'] += band_y1
+        tick['y_end'] += band_y1
+        tick['y_mid'] += band_y1
 
     main_ticks.sort(key=lambda t: t['x'])
     main_xs = np.array([t['x'] for t in main_ticks], dtype=int)
@@ -101,16 +97,12 @@ def recognize_main_scale(region: dict,
     # ── 可视化 ──
     vis_ticks = _draw_main_ticks(region, binary, main_ticks, vproj_norm, main_xs)
 
-    # v6.5: OCR 已迁出，vis_digits 用空图占位
-    empty_vis = np.zeros((100, 300, 3), dtype=np.uint8)
-
     return {
         'main_ticks': main_ticks,
         'main_gap': main_gap,
         'main_digits': [],  # v6.5: 留空，由 merger 定向填充
         'main_reading': main_reading,
         'vis_ticks': vis_ticks,
-        'vis_digits': empty_vis,
     }
 
 
@@ -142,6 +134,27 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
 
     binary_crop = binary[y_top:y_bottom, x_left:x_right].copy()
     return binary_crop, x_left, y_top
+
+
+def _find_threshold_segments(signal: np.ndarray,
+                             threshold_factor: float = 0.3) -> np.ndarray:
+    if signal is None or len(signal) == 0:
+        return np.array([], dtype=int)
+    mu = float(np.mean(signal))
+    sigma = float(np.std(signal))
+    threshold = max(mu + threshold_factor * sigma, 0.02)
+    mask = np.asarray(signal) > threshold
+    xs = []
+    start = None
+    for i, value in enumerate(mask):
+        if value and start is None:
+            start = i
+        elif not value and start is not None:
+            xs.append((start + i - 1) // 2)
+            start = None
+    if start is not None:
+        xs.append((start + len(mask) - 1) // 2)
+    return np.array(xs, dtype=int)
 
 
 def find_digit_cc_candidates(binary_crop: np.ndarray,
@@ -226,6 +239,14 @@ def _draw_main_ticks(region: dict,
 
     # 主图：增强灰度图上叠加刻线
     vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    band_y1, band_y2 = region.get('tick_band', (0, h))
+    band_y1 = max(0, min(h - 1, int(band_y1)))
+    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
+    overlay = vis.copy()
+    cv2.rectangle(overlay, (0, band_y1), (w - 1, band_y2 - 1), (0, 120, 60), -1)
+    vis = cv2.addWeighted(vis, 0.86, overlay, 0.14, 0)
+    cv2.line(vis, (0, band_y1), (w - 1, band_y1), (0, 180, 80), 1)
+    cv2.line(vis, (0, band_y2 - 1), (w - 1, band_y2 - 1), (0, 180, 80), 1)
 
     # 画刻度线
     for t in main_ticks:
@@ -272,5 +293,4 @@ def _empty_main_result() -> dict:
         'main_digits': [],
         'main_reading': 0.0,
         'vis_ticks': empty_img,
-        'vis_digits': empty_img,
     }

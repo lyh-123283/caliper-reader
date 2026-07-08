@@ -109,44 +109,10 @@ def preprocess(img: np.ndarray,
     intermediates['09_cc_filter'] = binary_adaptive.copy()
     result['binary_adaptive'] = binary_adaptive
 
-    roi_enhanced, roi_binary = _make_roi_structural_images(result['gray'])
-    result['roi_enhanced'] = roi_enhanced
-    result['roi_binary'] = roi_binary
-
     result['intermediates'] = intermediates
     result['debug_vis'] = _make_preprocess_vis(img, intermediates, gamma, median_ksize)
 
     return result
-
-
-def _make_roi_structural_images(gray: np.ndarray) -> tuple:
-    inv_gamma = 1.0 / config.preprocess.gamma if config.preprocess.gamma else 1.0
-    if abs(inv_gamma - 1.0) > 1e-6:
-        table = np.array(
-            [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
-        ).astype(np.uint8)
-        work = cv2.LUT(gray, table)
-    else:
-        work = gray.copy()
-
-    work = cv2.bilateralFilter(work, 11, 60.0, 60.0)
-    work = cv2.medianBlur(work, 9)
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-    enhanced = clahe.apply(work)
-    blur = cv2.GaussianBlur(enhanced, (0, 0), 1.5)
-    enhanced = cv2.addWeighted(enhanced, 1.5, blur, -0.5, 0)
-
-    binary = cv2.adaptiveThreshold(
-        enhanced, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=31,
-        C=5,
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    binary = _filter_small_components_by_contour(binary, 50)
-    return enhanced, binary
 
 
 def _filter_small_components_by_contour(binary: np.ndarray,

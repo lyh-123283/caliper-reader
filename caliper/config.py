@@ -232,7 +232,7 @@ class MainScaleConfig:
 # ═════════════════════════════════════════════════════════════
 
 class VernierScaleConfig:
-    """Vernier recognition params: projection -> fixed 0.02mm -> zero -> spacing fill -> alignment."""
+    """Vernier recognition params: projection window -> fixed 0.02mm -> alignment."""
 
     # ── 二值化（自适应阈值）──
     #     blockSize: 局部邻域大小（奇数）
@@ -240,45 +240,8 @@ class VernierScaleConfig:
     adaptive_block_size: int = 31
     adaptive_C: int = 4
 
-    # ── 峰值检测 ──
-    peak_min_dist: int = 2
-    #     越小越敏感，游标尺更密所以比主尺略高
-    peak_threshold_factor: float = 0.15
-
     # ── 最小刻线数 ──
     min_tick_count: int = 3
-
-
-    # ── 零线验证 ──
-    #     候选零线刻线长度需 >= median_len * factor
-    zero_length_factor: float = 0.4
-
-    # ── 零线 OCR 数字 0 验证 ──
-    #     搜索区域: y_start = int(h * ratio)，取下半个图
-    zero_digit_search_ratio: float = 0.50
-    #     搜索窗口半宽: max(min_px, int(w * ratio))
-    zero_digit_half_w_min: int = 12
-    zero_digit_half_w_ratio: float = 0.04
-    #     OCR 最低置信度
-    zero_digit_conf_min: float = 0.3
-    #     CLAHE 增强
-    zero_digit_clahe_clip: float = 2.5
-
-    # ── 等间距补全 & 校验 (refine_ticks_by_spacing) ──
-    #     是否启用（游标尺刻线更密，建议开启以补全漏检）
-    spacing_refine_enabled: bool = True
-    #     网格匹配容差比例（游标尺间距更小，容差稍大）
-    spacing_tolerance: float = 0.35
-    #     间距 > S*gap_factor 触发补全
-    spacing_gap_factor: float = 1.35
-    #     间距 < S*dup_factor 触发去重
-    spacing_dup_factor: float = 0.50
-    #     网格吸附容差
-    spacing_snap_ratio: float = 0.30
-
-    # ── 对齐查找 — 亚像素插值 ──
-    #     main_gap 最小值（防止除零）
-    min_main_gap: float = 10.0
 
     # ── 对齐置信度阈值 ──
     align_conf_perfect: float = 0.95  # 误差 <= 0.5px
