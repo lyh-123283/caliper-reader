@@ -22,7 +22,8 @@ from .config import config
 
 def split_scales(rotated_gray: np.ndarray,
                   rotated_binary: np.ndarray = None,
-                  rotated_color: np.ndarray = None) -> dict:
+                  rotated_color: np.ndarray = None,
+                  make_debug: bool = True) -> dict:
     """沿 y 轴切分主尺和游标尺区域"""
     h, w = rotated_gray.shape
 
@@ -81,9 +82,11 @@ def split_scales(rotated_gray: np.ndarray,
         'tick_band_global': vernier_band,
     }
 
-    split_vis = _make_split_vis(rotated_color if rotated_color is not None
-                                  else rotated_gray,
-                                  rotated_gray, binary, split_y, band_info)
+    split_vis = None
+    if make_debug:
+        split_vis = _make_split_vis(rotated_color if rotated_color is not None
+                                      else rotated_gray,
+                                      rotated_gray, binary, split_y, band_info)
 
     return {
         'region_main': region_main,

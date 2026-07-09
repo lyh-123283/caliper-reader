@@ -1121,7 +1121,8 @@ def _apply_near_integer_snap(mapped_ticks: List[dict],
 
 
 def _find_zero_from_band_detection(vernier_ticks: List[dict],
-                                   band_detection: dict):
+                                   band_detection: dict,
+                                   make_debug: bool = True):
     """Locate vernier zero from the already computed narrow-band ticks."""
     if not band_detection or not vernier_ticks:
         return None, None
@@ -1156,10 +1157,12 @@ def _find_zero_from_band_detection(vernier_ticks: List[dict],
     valley_candidates = [(0, float(roi_x2 - roi_x1), int(roi_x1), int(roi_x2), len(tick_xs))]
     best_valley = valley_candidates[0]
 
-    vis = _make_valley_projection_vis(
-        band, proj_norm, smooth, peaks, valleys, tick_xs, x1,
-        h_th, A, B, typical_gap,
-        valley_candidates, best_valley, found_tick)
+    vis = None
+    if make_debug:
+        vis = _make_valley_projection_vis(
+            band, proj_norm, smooth, peaks, valleys, tick_xs, x1,
+            h_th, A, B, typical_gap,
+            valley_candidates, best_valley, found_tick)
     return found_tick, vis
 
 
@@ -1325,7 +1328,8 @@ def _make_valley_projection_vis(band: np.ndarray,
 def recognize_vernier_scale(region: dict,
                              main_gap: float,
                              color_region: np.ndarray = None,
-                             main_ticks: List[dict] = None) -> dict:
+                             main_ticks: List[dict] = None,
+                             make_debug: bool = True) -> dict:
     """Vernier detection: body-range crop + split-anchored tick localization."""
     img = region['image']
     h, w = img.shape
@@ -1376,7 +1380,7 @@ def recognize_vernier_scale(region: dict,
     v_gap = float(np.median(np.diff([t['x'] for t in vernier_ticks]))) if len(vernier_ticks) >= 2 else 0.0
 
     zero_tick, valley_vis = _find_zero_from_band_detection(
-        vernier_ticks, band_detection
+        vernier_ticks, band_detection, make_debug=make_debug
     )
     zero_x = float(zero_tick['x']) if zero_tick else float(vernier_ticks[0]['x'])
 
@@ -1400,10 +1404,12 @@ def recognize_vernier_scale(region: dict,
     )
     vernier_xs = np.array([t['x'] for t in corrected_ticks], dtype=int)
 
-    vis_ticks = _draw_vernier_ticks(
-        region, binary, corrected_ticks, vproj_norm, vernier_xs,
-        zero_x_corrected, band_detection=band_detection
-    )
+    vis_ticks = None
+    if make_debug:
+        vis_ticks = _draw_vernier_ticks(
+            region, binary, corrected_ticks, vproj_norm, vernier_xs,
+            zero_x_corrected, band_detection=band_detection
+        )
 
     vernier_reading, aligned_tick, align_conf = find_best_alignment(
         mapped_ticks, precision, main_ticks
@@ -1412,10 +1418,12 @@ def recognize_vernier_scale(region: dict,
         aligned_tick, mapped_ticks, corrected_ticks
     )
 
-    vis_alignment = _draw_alignment(
-        region, color_region, corrected_ticks,
-        main_gap, zero_x_corrected, aligned_tick_corrected, align_conf
-    )
+    vis_alignment = None
+    if make_debug:
+        vis_alignment = _draw_alignment(
+            region, color_region, corrected_ticks,
+            main_gap, zero_x_corrected, aligned_tick_corrected, align_conf
+        )
 
     return {
         'vernier_ticks': mapped_ticks,

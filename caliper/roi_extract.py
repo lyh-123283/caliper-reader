@@ -7,6 +7,7 @@
 
 import cv2
 import numpy as np
+import time
 from typing import Tuple, List
 
 from .utils import rotate_image
@@ -20,18 +21,32 @@ from .vernier_rectify import _find_vernier_body_x_range
 
 def locate_roi_lowres(img_color: np.ndarray,
                       max_width: int = 1600) -> dict:
+    timings = {}
+
+    def mark(key: str, start_time: float):
+        timings[key] = (time.perf_counter() - start_time) * 1000.0
+
     h, w = img_color.shape[:2]
     scale = min(1.0, float(max_width) / float(w)) if w > 0 else 1.0
-    if scale < 1.0:
-        small = cv2.resize(
-            img_color, (int(round(w * scale)), int(round(h * scale))),
-            interpolation=cv2.INTER_AREA)
-    else:
-        small = img_color.copy()
+    t0 = time.perf_counter()
+    full_gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+    mark('gray_full', t0)
 
-    sh, sw = small.shape[:2]
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    t0 = time.perf_counter()
+    if scale < 1.0:
+        gray = cv2.resize(
+            full_gray, (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_LINEAR)
+    else:
+        gray = full_gray.copy()
+    mark('resize_gray_linear', t0)
+
+    sh, sw = gray.shape[:2]
+    t0 = time.perf_counter()
     enhanced = _make_lowres_roi_enhanced(gray)
+    mark('enhance_gamma_clahe', t0)
+
+    t0 = time.perf_counter()
     binary = cv2.adaptiveThreshold(
         enhanced, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -40,19 +55,31 @@ def locate_roi_lowres(img_color: np.ndarray,
         C=9,
     )
     fg = cv2.bitwise_not(binary)
+    mark('adaptive_threshold', t0)
 
+    t0 = time.perf_counter()
     y1, y2 = _proj_find_y_range(fg, sh)
-    x1, x2, x_diag = _proj_find_x_range(fg, y1, y2, sw)
-    if y2 - y1 < config.roi.min_roi_height or x2 - x1 < config.roi.min_roi_width:
-        return _lowres_roi_failure(img_color, small, enhanced, fg, (x1, y1, x2, y2))
+    mark('horizontal_projection', t0)
 
-    refined = _refine_roi_by_vernier_block(enhanced, y1, y2, x1, x2)
+    t0 = time.perf_counter()
+    x1, x2, x_diag = _proj_find_x_range(fg, y1, y2, sw)
+    mark('vertical_projection', t0)
+    if y2 - y1 < config.roi.min_roi_height or x2 - x1 < config.roi.min_roi_width:
+        return _lowres_roi_failure(timings, (x1, y1, x2, y2), scale)
+
+    t0 = time.perf_counter()
+    refined = _refine_roi_by_vernier_block(enhanced, y1, y2, x1, x2, timings)
     if refined is not None:
         y1, y2, x1, x2 = refined
+    mark('refine_vernier_block', t0)
+
+    t0 = time.perf_counter()
     reading_refined = _refine_roi_to_reading_window(enhanced, y1, y2, x1, x2, x_diag)
     if reading_refined is not None:
         y1, y2, x1, x2 = reading_refined
+    mark('refine_reading_window', t0)
 
+    t0 = time.perf_counter()
     inv_scale = 1.0 / scale if scale > 0 else 1.0
     ox1 = int(np.floor(x1 * inv_scale))
     oy1 = int(np.floor(y1 * inv_scale))
@@ -67,19 +94,20 @@ def locate_roi_lowres(img_color: np.ndarray,
     oy2 = min(h, oy2 + max(15, int(roi_h * 0.040)))
 
     if ox2 - ox1 < config.roi.min_roi_width or oy2 - oy1 < config.roi.min_roi_height:
-        return _lowres_roi_failure(img_color, small, enhanced, fg, (x1, y1, x2, y2))
+        mark('map_and_crop', t0)
+        return _lowres_roi_failure(timings, (x1, y1, x2, y2), scale)
 
-    debug = _make_lowres_roi_debug(
-        img_color, small, enhanced, fg,
-        (x1, y1, x2, y2), (ox1, oy1, ox2, oy2))
+    crop = img_color[oy1:oy2, ox1:ox2].copy()
+    mark('map_and_crop', t0)
     return {
-        'roi_color': img_color[oy1:oy2, ox1:ox2].copy(),
+        'roi_color': crop,
         'x_offset': ox1,
         'y_offset': oy1,
         'roi_box_original': (ox1, oy1, ox2, oy2),
         'roi_box_lowres': (x1, y1, x2, y2),
         'scale': scale,
-        'lowres_debug': debug,
+        'lowres_debug': None,
+        'roi_timings': timings,
         'locate_failed': False,
     }
 
@@ -103,67 +131,20 @@ def _odd_between(value: int, lo: int, hi: int) -> int:
     return min(hi if hi % 2 == 1 else hi - 1, value)
 
 
-def _lowres_roi_failure(img_color: np.ndarray,
-                        small: np.ndarray,
-                        enhanced: np.ndarray,
-                        fg: np.ndarray,
-                        box: tuple) -> dict:
-    debug = _make_lowres_roi_debug(
-        img_color, small, enhanced, fg, box,
-        (0, 0, img_color.shape[1], img_color.shape[0]))
+def _lowres_roi_failure(timings: dict,
+                        box: tuple,
+                        scale: float) -> dict:
     return {
         'roi_color': None,
         'x_offset': 0,
         'y_offset': 0,
         'roi_box_original': None,
         'roi_box_lowres': box,
-        'scale': 1.0,
-        'lowres_debug': debug,
+        'scale': scale,
+        'lowres_debug': None,
+        'roi_timings': timings,
         'locate_failed': True,
     }
-
-
-def _make_lowres_roi_debug(original: np.ndarray,
-                           small: np.ndarray,
-                           enhanced: np.ndarray,
-                           fg: np.ndarray,
-                           lowres_box: tuple,
-                           original_box: tuple) -> np.ndarray:
-    sw = small.shape[1]
-    x1, y1, x2, y2 = [int(v) for v in lowres_box]
-    ox1, oy1, ox2, oy2 = [int(v) for v in original_box]
-
-    small_vis = small.copy()
-    cv2.rectangle(small_vis, (x1, y1), (x2, y2), (0, 120, 255), 2)
-    cv2.putText(small_vis, "lowres ROI", (max(4, x1), max(18, y1 - 6)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 120, 255), 2, cv2.LINE_AA)
-
-    original_h = max(1, int(original.shape[0] * sw / original.shape[1]))
-    original_vis = cv2.resize(original, (sw, original_h), interpolation=cv2.INTER_AREA)
-    sx = sw / float(original.shape[1])
-    sy = original_h / float(original.shape[0])
-    cv2.rectangle(original_vis, (int(ox1 * sx), int(oy1 * sy)),
-                  (int(ox2 * sx), int(oy2 * sy)), (0, 255, 120), 2)
-    cv2.putText(original_vis, "mapped original ROI", (8, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 120), 2, cv2.LINE_AA)
-
-    enhanced_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
-    fg_vis = cv2.cvtColor(fg, cv2.COLOR_GRAY2BGR)
-    cv2.rectangle(enhanced_vis, (x1, y1), (x2, y2), (0, 120, 255), 2)
-    cv2.rectangle(fg_vis, (x1, y1), (x2, y2), (0, 120, 255), 2)
-
-    rows = [small_vis, original_vis, enhanced_vis, fg_vis]
-    out_w = max(r.shape[1] for r in rows)
-    padded = []
-    for row in rows:
-        if row.shape[1] < out_w:
-            pad = np.zeros((row.shape[0], out_w - row.shape[1], 3), dtype=np.uint8)
-            pad[:] = (30, 30, 35)
-            row = np.hstack([row, pad])
-        padded.append(row)
-    gap = np.zeros((6, out_w, 3), dtype=np.uint8)
-    gap[:] = (30, 30, 35)
-    return np.vstack([padded[0], gap, padded[1], gap, padded[2], gap, padded[3]])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -338,7 +319,8 @@ def _proj_find_x_range(binary: np.ndarray, y1: int, y2: int, w: int):
 
 def _refine_roi_by_vernier_block(enhanced: np.ndarray,
                                    y1: int, y2: int,
-                                   x1: int, x2: int):
+                                   x1: int, x2: int,
+                                   timings: dict = None):
     """
     v6.1: 用"卡尺金属面上下沿"+"游标压块右缘"精修 ROI。
 
@@ -368,18 +350,57 @@ def _refine_roi_by_vernier_block(enhanced: np.ndarray,
     # ── 1. y 边界：用读数区左中段找水平边缘 ──
     # 候选 x 段过宽时，右侧长尺尾部/滑块水平边会把上沿拉偏。
     # y 边界只需要读数区的代表性水平边，因此先收窄用于估计的 x 窗口。
+    t0 = time.perf_counter()
+    pad_x = max(50, int((x2 - x1) * 0.50))
+    pad_y = max(50, int((y2 - y1) * 0.35))
+    edge_x1 = max(0, x1 - pad_x)
+    edge_x2 = min(W - 1, x2 + pad_x)
+    edge_y1 = max(0, y1 - pad_y)
+    edge_y2 = min(H - 1, y2 + pad_y)
+    edge_crop = enhanced[edge_y1:edge_y2 + 1, edge_x1:edge_x2 + 1]
+
+    t0 = time.perf_counter()
+    edge_bw = _make_sobel_y_binary(edge_crop)
+    if timings is not None:
+        timings['refine_make_edge_map'] = (time.perf_counter() - t0) * 1000.0
+    if edge_bw is None:
+        return None
+
+    t0 = time.perf_counter()
     y_edge_x1, y_edge_x2 = _select_y_edge_x_window(x1, x2, W)
-    new_y1, new_y2 = _find_caliper_y_edges(enhanced, y_edge_x1, y_edge_x2, y1, y2)
+    y_edge_x1 = max(0, y_edge_x1 - edge_x1)
+    y_edge_x2 = min(edge_bw.shape[1] - 1, y_edge_x2 - edge_x1)
+    if timings is not None:
+        timings['refine_select_y_edge_window'] = (time.perf_counter() - t0) * 1000.0
+
+    t0 = time.perf_counter()
+    search_y1 = max(0, y1 - edge_y1)
+    search_y2 = min(edge_bw.shape[0] - 1, y2 - edge_y1)
+    new_y1, new_y2 = _find_caliper_y_edges(
+        edge_bw, y_edge_x1, y_edge_x2, search_y1, search_y2
+    )
+    if timings is not None:
+        timings['refine_find_y_edges'] = (time.perf_counter() - t0) * 1000.0
     if new_y1 is None or new_y2 is None or new_y2 - new_y1 < 80:
         new_y1, new_y2 = y1, y2
     else:
+        new_y1 += edge_y1
+        new_y2 += edge_y1
         # v6.4: 给下方留出游标尺数字行空间（约 30% 卡尺高度）
         caliper_h = new_y2 - new_y1
         extra_below = int(caliper_h * 0.35)
         new_y2 = min(H - 1, new_y2 + extra_below)
 
     # ── 2. x 右边界：用 y 上沿水平边缘的右端 x 作为压块右缘 ──
-    new_x2 = _find_caliper_right_edge(enhanced, new_y1, new_y2, x1)
+    t0 = time.perf_counter()
+    right_y1 = max(0, new_y1 - edge_y1)
+    right_y2 = min(edge_bw.shape[0] - 1, new_y2 - edge_y1)
+    right_x1 = max(0, x1 - edge_x1)
+    new_x2 = _find_caliper_right_edge(edge_bw, right_y1, right_y2, right_x1)
+    if new_x2 is not None:
+        new_x2 += edge_x1
+    if timings is not None:
+        timings['refine_find_right_edge'] = (time.perf_counter() - t0) * 1000.0
     if new_x2 is None or new_x2 <= x1 + 200:
         new_x2 = x2
 
@@ -464,7 +485,20 @@ def _select_y_edge_x_window(x1: int, x2: int, image_w: int) -> Tuple[int, int]:
     return x1, x2
 
 
-def _find_caliper_y_edges(enhanced: np.ndarray,
+def _make_sobel_y_binary(enhanced: np.ndarray):
+    if enhanced is None:
+        return None
+    sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=5)
+    abs_y = np.abs(sobel_y)
+    g_max = float(np.max(abs_y))
+    if g_max <= 0:
+        return None
+    abs_y_u8 = (abs_y / g_max * 255).astype(np.uint8)
+    _, bw = cv2.threshold(abs_y_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return bw
+
+
+def _find_caliper_y_edges(edge_bw: np.ndarray,
                             x_lo: int, x_hi: int,
                             y_search_lo: int, y_search_hi: int):
     """
@@ -481,21 +515,13 @@ def _find_caliper_y_edges(enhanced: np.ndarray,
          分别找投影最强 y，取强度较大者
       4. 上沿=较小 y，下沿=较大 y
     """
-    if enhanced is None:
+    if edge_bw is None:
         return None, None
-    H, W = enhanced.shape[:2]
+    H, W = edge_bw.shape[:2]
     x_lo = max(0, x_lo); x_hi = min(W - 1, x_hi)
     y_search_lo = max(0, y_search_lo); y_search_hi = min(H - 1, y_search_hi)
 
-    sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=5)
-    abs_y = np.abs(sobel_y)
-    g_max = float(np.max(abs_y))
-    if g_max <= 0:
-        return None, None
-    abs_y_u8 = (abs_y / g_max * 255).astype(np.uint8)
-    _, bw = cv2.threshold(abs_y_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    strip = bw[:, x_lo:x_hi + 1]
+    strip = edge_bw[:, x_lo:x_hi + 1]
     hproj = np.sum(strip == 255, axis=1).astype(float)
 
     region_proj = hproj[y_search_lo:y_search_hi + 1]
@@ -537,7 +563,7 @@ def _find_caliper_y_edges(enhanced: np.ndarray,
     return top_y, bot_y
 
 
-def _find_caliper_right_edge(enhanced: np.ndarray,
+def _find_caliper_right_edge(edge_bw: np.ndarray,
                                y_lo: int, y_hi: int,
                                x_lo: int):
     """
@@ -552,33 +578,26 @@ def _find_caliper_right_edge(enhanced: np.ndarray,
       3. 对每行，从右往左扫描，找"该行最右侧 1 像素 x"
       4. 取所有行的"最右 x"中的最大值（即整个金属面的右缘）
     """
-    if enhanced is None:
+    if edge_bw is None:
         return None
-    H, W = enhanced.shape[:2]
+    H, W = edge_bw.shape[:2]
     y_lo = max(0, y_lo); y_hi = min(H - 1, y_hi)
     x_lo = max(0, x_lo)
     if y_hi - y_lo < 50:
         return None
 
-    sobel_y = cv2.Sobel(enhanced, cv2.CV_64F, 0, 1, ksize=5)
-    abs_y = np.abs(sobel_y)
-    g_max = float(np.max(abs_y))
-    if g_max <= 0:
-        return None
-    abs_y_u8 = (abs_y / g_max * 255).astype(np.uint8)
-    _, bw = cv2.threshold(abs_y_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
     # 只看 y 范围内的行
-    strip = bw[y_lo:y_hi + 1, :]
+    strip = edge_bw[y_lo:y_hi + 1, :]
 
-    # 对每行找"最右侧白像素 x"
-    right_xs = []
-    for row in strip:
-        idx = np.where(row == 255)[0]
-        if len(idx) > 0 and idx[-1] > x_lo:
-            right_xs.append(int(idx[-1]))
+    mask = strip == 255
+    row_has_edge = np.any(mask[:, x_lo + 1:], axis=1) if x_lo + 1 < W else np.zeros(mask.shape[0], dtype=bool)
+    if not np.any(row_has_edge):
+        return None
 
-    if not right_xs:
+    reversed_idx = np.argmax(mask[row_has_edge, ::-1], axis=1)
+    right_xs = W - 1 - reversed_idx
+    right_xs = right_xs[right_xs > x_lo]
+    if right_xs.size == 0:
         return None
 
     # 取所有右端 x 的 90 分位（去掉个别噪声/反光，保留真实右缘）
@@ -701,207 +720,288 @@ def _white_foreground_binary(binary: np.ndarray, gray: np.ndarray) -> np.ndarray
     return out
 
 
-def _estimate_orient_angle_from_tick_pixels(gray: np.ndarray,
-                                            binary: np.ndarray) -> Tuple[float, dict]:
-    h, w = gray.shape[:2]
-    if h < 40 or w < 80:
-        return None, {}
-
-    fg = _white_foreground_binary(binary, gray)
-    try:
-        from .region_split import _split_by_vernier_tick_band, _split_by_gray_seam
-        split_y = _split_by_vernier_tick_band(gray, fg, h, w)
-        if split_y is None:
-            split_y = _split_by_gray_seam(gray, h, w)
-    except Exception:
-        split_y = None
-    if split_y is None:
-        split_y = int(h * 0.58)
-
-    band_h = max(36, min(90, int(h * 0.22)))
-    y1 = max(0, int(split_y) - band_h)
-    y2 = max(y1 + 1, min(h, int(split_y) - 4))
-    band = fg[y1:y2, :]
-    if band.size == 0:
-        return None, {'split_y': split_y, 'count': 0}
-
-    kernel_h = max(9, min(31, ((y2 - y1) // 2) * 2 + 1))
-    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_h))
-    vertical = cv2.morphologyEx(band, cv2.MORPH_OPEN, vertical_kernel)
-    labels_count, labels, stats, _ = cv2.connectedComponentsWithStats(
-        (vertical > 0).astype('uint8'), 8)
-
-    deviations = []
-    min_h = max(10, int((y2 - y1) * 0.28))
-    for label in range(1, labels_count):
-        x, y, bw, bh, area = stats[label]
-        if bh < min_h or bw > 14 or area < bh * 0.6:
-            continue
-        ys, xs = np.where(labels == label)
-        if len(xs) < 8:
-            continue
-        rows = []
-        centers = []
-        for yy in np.unique(ys):
-            xx = xs[ys == yy]
-            if len(xx) > 0:
-                rows.append(float(yy + y1))
-                centers.append(float(np.mean(xx)))
-        if len(rows) < 6:
-            continue
-        slope, _ = np.polyfit(np.asarray(rows), np.asarray(centers), 1)
-        deviation = float(np.degrees(np.arctan(slope)))
-        if abs(deviation) <= 4.0:
-            deviations.append(deviation)
-
-    diag = {'split_y': int(split_y), 'band_y1': y1, 'band_y2': y2,
-            'count': len(deviations)}
-    if len(deviations) < 30:
-        return None, diag
-
-    arr = np.asarray(deviations, dtype=float)
-    median = float(np.median(arr))
-    mad = float(np.median(np.abs(arr - median)))
-    keep = np.abs(arr - median) <= max(0.35, 3.0 * mad)
-    if np.count_nonzero(keep) >= 20:
-        median = float(np.median(arr[keep]))
-    diag.update({'raw_deviation': median, 'mad': mad,
-                 'kept': int(np.count_nonzero(keep))})
-    if mad > 0.9:
-        return None, diag
-
-    angle = -median
-    if abs(angle) < 0.15 or abs(angle) > min(config.orient.rotate_max_angle, 4.0):
-        angle = 0.0
-    return angle, diag
-
-
-def _estimate_orient_angle_from_hough(gray: np.ndarray) -> float:
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    orient_gray = clahe.apply(gray)
-    edges = cv2.Canny(orient_gray, config.orient.canny_low, config.orient.canny_high)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
-                            threshold=max(25, int(config.orient.hough_threshold * 0.65)),
-                            minLineLength=max(config.orient.hough_min_length, int(gray.shape[1] * 0.03)),
-                            maxLineGap=max(config.orient.hough_max_gap, 12))
-    if lines is None or len(lines) == 0:
-        return 0.0
-
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        a = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
-        if a < -180:
-            a += 360
-        if a > 180:
-            a -= 360
-        if config.orient.angle_min <= abs(a) <= config.orient.angle_max:
-            angles.append(a)
-    if not angles:
-        return 0.0
-
-    deviations = []
-    for a in angles:
-        if a >= 0:
-            deviations.append(a - 90.0)
-        else:
-            deviations.append(a + 90.0)
-    deviations.sort()
-    n = len(deviations)
-    trim = max(1, int(n * config.orient.trim_ratio))
-    trimmed = deviations[trim:n - trim] if n > trim * 2 else deviations
-    angle = float(np.median(trimmed))
-    if abs(angle) < config.orient.rotate_min_angle or abs(angle) > min(config.orient.rotate_max_angle, 4.0):
-        angle = 0.0
-    return angle
-
-
-def _estimate_seam_angle_from_gradient(gray: np.ndarray,
-                                       binary: np.ndarray) -> Tuple[float, dict]:
+def _estimate_seam_angle_ransac(gray: np.ndarray,
+                                binary: np.ndarray) -> Tuple[float, dict]:
     h, w = gray.shape[:2]
     if h < 40 or w < 160:
         return None, {}
 
     fg = _white_foreground_binary(binary, gray)
-    try:
-        from .region_split import _split_by_vernier_tick_band, _split_by_gray_seam
-        split_y = _split_by_vernier_tick_band(gray, fg, h, w)
-        if split_y is None:
-            split_y = _split_by_gray_seam(gray, h, w)
-    except Exception:
-        split_y = None
-    if split_y is None:
-        split_y = int(h * 0.58)
+    seeds = _seam_seed_candidates(gray, fg)
+    results = []
+    for seed_y in seeds:
+        result = _detect_seam_line_for_seed(gray, seed_y)
+        if result is not None:
+            results.append(result)
+            if _is_high_quality_seam(result):
+                angle = float(result['angle'])
+                diag = {
+                    'method': 'seam_ransac',
+                    'seeds': [int(v) for v in seeds],
+                    'candidates': [_summarize_seam_candidate(r) for r in results],
+                    'early_stop': True,
+                }
+                diag.update(_summarize_seam_candidate(result))
+                diag['raw_angle'] = angle
+                return angle, diag
 
-    band_half = max(28, h // 12)
-    y1 = max(0, int(split_y) - band_half)
-    y2 = min(h, int(split_y) + band_half)
-    crop = gray[y1:y2, :]
-    if crop.size == 0:
-        return None, {'split_y': int(split_y), 'points': 0}
-
-    blur = cv2.GaussianBlur(crop, (5, 5), 0)
-    grad_y = cv2.Scharr(blur, cv2.CV_32F, 0, 1)
-    score = np.abs(grad_y)
-    score = cv2.blur(score, (max(9, w // 180), 1))
-
-    xs = []
-    ys = []
-    weights = []
-    step = max(4, w // 450)
-    margin = max(20, w // 80)
-    threshold = max(4.0, float(np.percentile(score, 78)))
-    for x0 in range(margin, w - margin, step):
-        x1b = max(0, x0 - step)
-        x2b = min(w, x0 + step + 1)
-        col = np.mean(score[:, x1b:x2b], axis=1)
-        if col.size == 0:
-            continue
-        yi = int(np.argmax(col))
-        val = float(col[yi])
-        if val < threshold:
-            continue
-        xs.append(float(x0))
-        ys.append(float(yi + y1))
-        weights.append(val)
-
-    diag = {'split_y': int(split_y), 'points': len(xs)}
-    if len(xs) < 80:
+    diag = {
+        'method': 'seam_ransac',
+        'seeds': [int(v) for v in seeds],
+        'candidates': [_summarize_seam_candidate(r) for r in results],
+        'early_stop': False,
+    }
+    valid = [r for r in results if r.get('valid')]
+    if not valid:
+        diag['reason'] = 'no_valid_seam'
         return None, diag
 
-    x = np.asarray(xs, dtype=float)
-    y = np.asarray(ys, dtype=float)
-    weight = np.asarray(weights, dtype=float)
-    keep = np.ones(len(x), dtype=bool)
-    coef = None
-    mad = 0.0
-    for _ in range(4):
-        coef = np.polyfit(x[keep], y[keep], 1, w=weight[keep])
-        resid = y - (coef[0] * x + coef[1])
-        good_resid = resid[keep]
-        mad = float(np.median(np.abs(good_resid - np.median(good_resid))))
-        tol = max(3.0, 3.5 * mad)
-        keep = np.abs(resid) <= tol
-        if np.count_nonzero(keep) < 50:
-            break
-
-    kept = int(np.count_nonzero(keep))
-    coverage = float((np.max(x[keep]) - np.min(x[keep])) / max(w, 1)) if kept else 0.0
-    diag.update({'kept': kept, 'mad': mad, 'coverage': coverage})
-    if kept < 80 or coverage < 0.45:
-        return None, diag
-
-    coef = np.polyfit(x[keep], y[keep], 1, w=weight[keep])
-    angle = float(np.degrees(np.arctan(coef[0])))
+    best = max(valid, key=lambda r: r['rank'])
+    angle = float(best['angle'])
+    diag.update(_summarize_seam_candidate(best))
     diag['raw_angle'] = angle
-    if abs(angle) < 0.05 or abs(angle) > 0.85 or mad > 4.0:
+    if abs(angle) > 2.0:
+        diag['reason'] = 'angle_out_of_range'
         return None, diag
     return angle, diag
 
 
+def _is_high_quality_seam(result: dict) -> bool:
+    return (
+        bool(result.get('valid')) and
+        int(result.get('kept', 0)) >= 160 and
+        float(result.get('coverage', 0.0)) >= 0.55 and
+        float(result.get('mad', 999.0)) <= 0.25 and
+        abs(float(result.get('angle', 999.0))) <= 2.0
+    )
+
+
+def _seam_seed_candidates(gray: np.ndarray,
+                          fg: np.ndarray) -> List[int]:
+    h, w = gray.shape[:2]
+    seeds = []
+    try:
+        from .region_split import _split_by_vernier_tick_band, _split_by_gray_seam
+        first = _split_by_vernier_tick_band(gray, fg, h, w)
+        second = _split_by_gray_seam(gray, h, w)
+        if first is not None:
+            seeds.append(int(first))
+        if second is not None:
+            seeds.append(int(second))
+    except Exception:
+        pass
+    seeds.extend([int(h * 0.58), int(h * 0.64), int(h * 0.70)])
+
+    out = []
+    for seed in seeds:
+        seed = max(0, min(h - 1, int(seed)))
+        if all(abs(seed - old) > 15 for old in out):
+            out.append(seed)
+    return out
+
+
+def _detect_seam_line_for_seed(gray: np.ndarray,
+                               seed_y: int) -> dict:
+    h, w = gray.shape[:2]
+    band_half = max(35, int(h * 0.08))
+    y1 = max(0, int(seed_y) - band_half)
+    y2 = min(h, int(seed_y) + band_half)
+    crop = gray[y1:y2, :]
+    if crop.size == 0:
+        return None
+
+    blur = cv2.GaussianBlur(crop, (3, 3), 0)
+    score = np.abs(cv2.Scharr(blur, cv2.CV_32F, 0, 1))
+    score = cv2.blur(score, (max(9, (w // 180) | 1), 1))
+    threshold = max(6.0, float(np.percentile(score, 83)))
+    step = max(6, w // 320)
+    margin = max(20, w // 80)
+
+    points = []
+    for x0 in range(margin, w - margin, step):
+        x1b = max(0, x0 - step)
+        x2b = min(w, x0 + step + 1)
+        col = np.mean(score[:, x1b:x2b], axis=1)
+        for yi, val in _local_1d_peaks(col, min_sep=6, top_k=2):
+            if val >= threshold:
+                points.append((float(x0), float(yi + y1), float(val)))
+
+    if len(points) < 50:
+        return {
+            'seed_y': int(seed_y), 'band_y1': y1, 'band_y2': y2,
+            'points': len(points), 'valid': False, 'reason': 'few_points'
+        }
+
+    xs = np.asarray([p[0] for p in points], dtype=float)
+    ys = np.asarray([p[1] for p in points], dtype=float)
+    weights = np.asarray([p[2] for p in points], dtype=float)
+    best = _ransac_seam_line(xs, ys, weights, seed_y, h, w)
+    if best is None:
+        return {
+            'seed_y': int(seed_y), 'band_y1': y1, 'band_y2': y2,
+            'points': len(points), 'valid': False, 'reason': 'no_ransac'
+        }
+
+    a, b, keep = best
+    for _ in range(3):
+        fit = _weighted_line_fit(xs[keep], ys[keep], weights[keep])
+        if fit is None:
+            break
+        a, b = fit
+        resid = ys - (a * xs + b)
+        good_resid = resid[keep]
+        mad0 = _median_abs_dev(good_resid)
+        new_keep = np.abs(resid) <= max(max(3.0, h * 0.004), 3.5 * mad0)
+        if np.count_nonzero(new_keep) < 40:
+            break
+        keep = new_keep
+
+    resid = ys - (a * xs + b)
+    in_res = np.abs(resid[keep])
+    mad = _median_abs_dev(in_res) if in_res.size else 999.0
+    kept = int(np.count_nonzero(keep))
+    coverage = float((np.max(xs[keep]) - np.min(xs[keep])) / max(w, 1)) if kept else 0.0
+    angle = float(np.degrees(np.arctan(a)))
+    mid_y = float(a * (w * 0.5) + b)
+    valid = (
+        kept >= 70 and coverage >= 0.45 and mad <= 4.0 and
+        abs(angle) <= 2.0 and 0.48 * h <= mid_y <= 0.78 * h
+    )
+    rank = float(np.sum(weights[keep]) * coverage / (1.0 + mad)) if valid else -1.0
+    return {
+        'seed_y': int(seed_y),
+        'band_y1': y1,
+        'band_y2': y2,
+        'points': len(points),
+        'kept': kept,
+        'coverage': coverage,
+        'mad': mad,
+        'angle': angle,
+        'mid_y': mid_y,
+        'rank': rank,
+        'valid': valid,
+        'line': (float(a), float(b)),
+        'threshold': threshold,
+    }
+
+
+def _local_1d_peaks(values: np.ndarray,
+                    min_sep: int = 5,
+                    top_k: int = 3) -> List[Tuple[int, float]]:
+    if values is None or len(values) < 3:
+        return []
+    candidates = []
+    for i in range(1, len(values) - 1):
+        if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
+            candidates.append((float(values[i]), i))
+    candidates.sort(reverse=True)
+    peaks = []
+    used = []
+    for val, idx in candidates:
+        if all(abs(idx - old) >= min_sep for old in used):
+            peaks.append((idx, val))
+            used.append(idx)
+            if len(peaks) >= top_k:
+                break
+    return peaks
+
+
+def _ransac_seam_line(xs: np.ndarray,
+                      ys: np.ndarray,
+                      weights: np.ndarray,
+                      seed_y: int,
+                      h: int,
+                      w: int):
+    if len(xs) < 2:
+        return None
+    rng = np.random.default_rng(1234)
+    tol = max(3.0, h * 0.004)
+    mid_x = w * 0.5
+    n = len(xs)
+    sample_count = 450
+    i = rng.integers(0, n, size=sample_count)
+    j = rng.integers(0, n, size=sample_count)
+    valid_pair = (i != j) & (np.abs(xs[i] - xs[j]) >= w * 0.15)
+    if not np.any(valid_pair):
+        return None
+
+    i = i[valid_pair]
+    j = j[valid_pair]
+    a = (ys[j] - ys[i]) / (xs[j] - xs[i])
+    angle = np.degrees(np.arctan(a))
+    b = ys[i] - a * xs[i]
+    mid_y = a * mid_x + b
+    seed_tol = max(35, int(h * 0.08)) * 0.75
+    valid = (
+        (np.abs(angle) <= 2.0) &
+        (mid_y >= 0.48 * h) &
+        (mid_y <= 0.78 * h) &
+        (np.abs(mid_y - seed_y) <= seed_tol)
+    )
+    if not np.any(valid):
+        return None
+
+    a = a[valid]
+    b = b[valid]
+    resid = np.abs(ys[None, :] - (a[:, None] * xs[None, :] + b[:, None]))
+    keep = resid <= tol
+    counts = np.count_nonzero(keep, axis=1)
+    valid_rows = counts >= 40
+    if not np.any(valid_rows):
+        return None
+
+    keep = keep[valid_rows]
+    a = a[valid_rows]
+    b = b[valid_rows]
+    x_kept = np.where(keep, xs[None, :], np.nan)
+    x_min = np.nanmin(x_kept, axis=1)
+    x_max = np.nanmax(x_kept, axis=1)
+    coverage = (x_max - x_min) / max(w, 1)
+    valid_rows = coverage >= 0.35
+    if not np.any(valid_rows):
+        return None
+
+    keep = keep[valid_rows]
+    a = a[valid_rows]
+    b = b[valid_rows]
+    coverage = coverage[valid_rows]
+    score = np.sum(keep * weights[None, :], axis=1) * coverage
+    best_idx = int(np.argmax(score))
+    return float(a[best_idx]), float(b[best_idx]), keep[best_idx]
+
+
+def _weighted_line_fit(xs: np.ndarray,
+                       ys: np.ndarray,
+                       weights: np.ndarray):
+    if len(xs) < 2:
+        return None
+    try:
+        coef = np.polyfit(xs, ys, 1, w=np.maximum(weights, 1e-3))
+        return float(coef[0]), float(coef[1])
+    except Exception:
+        return None
+
+
+def _median_abs_dev(values: np.ndarray) -> float:
+    if values is None or len(values) == 0:
+        return 999.0
+    values = np.asarray(values, dtype=float)
+    med = float(np.median(values))
+    return float(np.median(np.abs(values - med)))
+
+
+def _summarize_seam_candidate(result: dict) -> dict:
+    keys = (
+        'seed_y', 'band_y1', 'band_y2', 'points', 'kept',
+        'coverage', 'mad', 'angle', 'mid_y', 'rank', 'valid', 'reason'
+    )
+    return {k: result[k] for k in keys if k in result}
+
+
 def orient_caliper(roi_color: np.ndarray,
                     roi_gray: np.ndarray,
-                    roi_binary: np.ndarray = None) -> dict:
+                    roi_binary: np.ndarray = None,
+                    make_debug: bool = True) -> dict:
     """
     检测刻度线主导方向，旋转图像使刻线垂直。
 
@@ -910,35 +1010,39 @@ def orient_caliper(roi_color: np.ndarray,
     """
     gray = roi_gray if roi_gray is not None else cv2.cvtColor(roi_color, cv2.COLOR_BGR2GRAY)
 
-    angle, orient_diag = _estimate_orient_angle_from_tick_pixels(gray, roi_binary)
-    if angle is None:
-        angle = _estimate_orient_angle_from_hough(gray)
-        orient_diag = {'method': 'hough'}
+    angle_scale = float(getattr(config.orient, 'angle_detection_scale', 1.0) or 1.0)
+    if 0 < angle_scale < 0.999:
+        h, w = gray.shape[:2]
+        small_w = max(1, int(round(w * angle_scale)))
+        small_h = max(1, int(round(h * angle_scale)))
+        angle_gray = cv2.resize(gray, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        angle_binary = (
+            cv2.resize(roi_binary, (small_w, small_h), interpolation=cv2.INTER_NEAREST)
+            if roi_binary is not None else None
+        )
+        seam_angle, seam_diag = _estimate_seam_angle_ransac(angle_gray, angle_binary)
+        if isinstance(seam_diag, dict):
+            seam_diag = dict(seam_diag)
+            seam_diag['angle_detection_scale'] = angle_scale
     else:
-        orient_diag['method'] = 'tick_pixels'
-
-    coarse_angle = float(angle)
-    rotated_color = rotate_image(roi_color, coarse_angle)
-    rotated_gray = rotate_image(gray, coarse_angle)
-    rotated_binary = rotate_image(roi_binary, coarse_angle) if roi_binary is not None else None
-
-    fine_angle, seam_diag = _estimate_seam_angle_from_gradient(rotated_gray, rotated_binary)
-    if fine_angle is not None:
-        angle = coarse_angle + float(fine_angle)
-        orient_diag['method'] = f"{orient_diag.get('method', 'unknown')}+seam"
-    else:
-        fine_angle = 0.0
-        angle = coarse_angle
+        seam_angle, seam_diag = _estimate_seam_angle_ransac(gray, roi_binary)
+    if seam_angle is None:
+        seam_angle = 0.0
+    angle = float(seam_angle)
 
     rotated_color = rotate_image(roi_color, angle)
     rotated_gray = rotate_image(gray, angle)
     rotated_binary = rotate_image(roi_binary, angle) if roi_binary is not None else None
 
-    orient_diag['coarse_tick_angle'] = coarse_angle
-    orient_diag['fine_seam_angle'] = float(fine_angle)
-    orient_diag['final_angle'] = float(angle)
-    orient_diag['seam'] = seam_diag
-    orient_vis = _make_orient_vis(roi_color, rotated_color, angle)
+    orient_diag = {
+        'method': 'seam_ransac',
+        'seam_angle': float(seam_angle),
+        'residual_angle': None,
+        'final_angle': float(angle),
+        'seam': seam_diag,
+        'residual': None,
+    }
+    orient_vis = _make_orient_vis(roi_color, rotated_color, angle) if make_debug else None
 
     return {
         'rotated_color': rotated_color,

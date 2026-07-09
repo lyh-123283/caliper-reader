@@ -1,0 +1,102 @@
+[
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "0",
+    "bbox": [
+      867,
+      1417,
+      980,
+      1539
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "1",
+    "bbox": [
+      1116,
+      1423,
+      1205,
+      1533
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "2",
+    "bbox": [
+      1365,
+      1430,
+      1457,
+      1536
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "3",
+    "bbox": [
+      1611,
+      1420,
+      1710,
+      1533
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "4",
+    "bbox": [
+      1853,
+      1434,
+      1949,
+      1526
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "5",
+    "bbox": [
+      2096,
+      1413,
+      2195,
+      1533
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "6",
+    "bbox": [
+      2345,
+      1423,
+      2444,
+      1529
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "7",
+    "bbox": [
+      2584,
+      1420,
+      2683,
+      1526
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "8",
+    "bbox": [
+      2847,
+      1423,
+      2929,
+      1526
+    ]
+  },
+  {
+    "image": "youbiaokachi.jpg",
+    "digit": "9",
+    "bbox": [
+      3082,
+      1420,
+      3171,
+      1526
+    ]
+  }
+]

@@ -10,6 +10,7 @@ from typing import List, Tuple
 import warnings
 from .result import DigitInfo
 from .config import config
+from .template_ocr import TemplateDigitRecognizer
 
 _HAS_TESSERACT = False
 try:
@@ -155,6 +156,7 @@ class DigitReader:
 
     def __init__(self):
         self._easyocr = None
+        self._template_ocr = TemplateDigitRecognizer()
         self._engine = None  # None = 未初始化，在 _ensure_engine 中决定
         self._debug_patches = []
         self._engine_status = ""  # 诊断信息
@@ -501,6 +503,9 @@ class DigitReader:
     # ---- OCR ----
 
     def _ocr_single_patch(self, patch):
+        if self._engine == 'template':
+            result = self._template_ocr.recognize(patch)
+            return [result] if result else []
         if self._engine == 'tesseract':
             return self._ocr_tess(patch)
         if self._engine == 'easyocr' and self._easyocr:
@@ -586,6 +591,10 @@ class DigitReader:
     def _ensure_engine(self):
         """延迟初始化 OCR 引擎，按优先级尝试：tesseract → easyocr → fallback"""
         if self._engine is not None:
+            return
+        if self._template_ocr.available():
+            self._engine = 'template'
+            self._engine_status = f"Template OCR ({self._template_ocr.template_dir})"
             return
 
         # ── 1) 尝试 tesseract ──

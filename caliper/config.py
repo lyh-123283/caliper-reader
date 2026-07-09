@@ -56,6 +56,7 @@ class PreprocessConfig:
     #     C: 从均值中减去的常数，越大二值化越保守（白像素越少）
     adaptive_block_size: int = 91
     adaptive_C: int = 17
+    adaptive_binary_scale: float = 0.8
 
     # ── 后处理：形态学开运算（二值化后去噪）──
     #     先腐蚀再膨胀，消除孤立小噪点
@@ -67,7 +68,7 @@ class PreprocessConfig:
     #     剔除面积小于阈值的孤立连通域（白连通域=噪声斑块）
     #     v6.5: 从 15 增加到 50，更激进地过滤背景墙椒盐噪声
     #     (主尺刻度线连通域面积一般 > 200，安全裕量充足)
-    cc_filter_enabled: bool = True
+    cc_filter_enabled: bool = False
     cc_min_area: int = 50             # 最小面积（像素）
 
 
@@ -119,6 +120,8 @@ class ROIExtractConfig:
 # ═════════════════════════════════════════════════════════════
 
 class OrientConfig:
+    angle_detection_scale: float = 0.75
+
     """方向矫正参数：Canny 边缘 → HoughLinesP 检测 → 角度统计 → 旋转"""
 
     # ── Canny 边缘检测 ──

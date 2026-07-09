@@ -63,6 +63,7 @@ class CaliperApp:
         self._is_processing = False
         self._latest_file_path = ""
         self._auto_follow_progress = True
+        self.fast_mode_var = tk.BooleanVar(value=True)
 
         # 动态标签页
         self.tab_widgets = {}
@@ -77,6 +78,7 @@ class CaliperApp:
                         background=self.bg_color, foreground=self.fg_color)
 
         self._build_ui()
+        self._preload_ocr()
 
     def _build_ui(self):
         """构建界面"""
@@ -119,6 +121,17 @@ class CaliperApp:
         )
         self.status_label.pack(side=tk.LEFT, padx=15, pady=5)
 
+    def _preload_ocr(self):
+        try:
+            from caliper.ocr import get_ocr_reader_singleton
+            reader = get_ocr_reader_singleton()
+            status = reader.engine_status()
+            if hasattr(self, 'lbl_ocr_engine'):
+                self.lbl_ocr_engine.config(text=f"OCR: {status}", fg=self.success_color)
+        except Exception as exc:
+            if hasattr(self, 'lbl_ocr_engine'):
+                self.lbl_ocr_engine.config(text=f"OCR: 预加载失败 ({exc})", fg="#f38ba8")
+
     def _build_control_panel(self, parent: tk.Frame):
         """构建左侧控制面板"""
         panel = tk.Frame(parent, bg=self.card_color, width=270)
@@ -137,6 +150,17 @@ class CaliperApp:
             command=self._open_image
         )
         self.btn_open.pack(fill=tk.X, pady=(0, 10))
+
+        self.chk_fast_mode = tk.Checkbutton(
+            inner, text="快速模式（少生成调试图）",
+            variable=self.fast_mode_var,
+            font=("Microsoft YaHei", 9),
+            bg=self.card_color, fg=self.fg_color,
+            activebackground=self.card_color,
+            activeforeground=self.fg_color,
+            selectcolor=self.bg_color
+        )
+        self.chk_fast_mode.pack(anchor=tk.W, pady=(0, 10))
 
         # 结果展示区
         tk.Label(
@@ -489,6 +513,7 @@ class CaliperApp:
                     )
 
                 self.root.after(0, lambda: self._on_image_loaded_for_progress(img))
+                self.pipeline.fast_mode = bool(self.fast_mode_var.get())
                 result = self.pipeline.run(img, progress_callback=progress)
                 self.root.after(0, lambda: self._on_image_processed(img, result, file_path))
             except Exception as e:
@@ -513,10 +538,14 @@ class CaliperApp:
         self.btn_open.config(state=tk.NORMAL)
         self._is_processing = False
 
+        timings = result.extra_info.get('timings', {}) if isinstance(result.extra_info, dict) else {}
+        total_ms = timings.get('total', {}).get('ms') if isinstance(timings, dict) else None
+        time_text = f" | 耗时: {total_ms:.0f}ms" if isinstance(total_ms, (int, float)) else ""
         self.status_label.config(
             text=f"✅ 识别完成 — {os.path.basename(file_path)} | "
                  f"精度: {result.precision:.2f}mm | "
                  f"结果: {result.total:.3f}mm"
+                 f"{time_text}"
         )
 
     def _on_image_process_error(self, error: Exception):

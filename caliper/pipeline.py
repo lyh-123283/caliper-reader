@@ -12,6 +12,7 @@
 
 import cv2
 import numpy as np
+import time
 
 from .result import CaliperResult
 from .preprocess import preprocess
@@ -27,9 +28,12 @@ from .config import config
 class CaliperPipeline:
     """游标卡尺识别流水线"""
 
-    def __init__(self):
+    def __init__(self, fast_mode: bool = False):
         self.debug_images = {}
         self.step_results = {}
+        self.timings = {}
+        self._pipeline_t0 = 0.0
+        self.fast_mode = fast_mode
 
         # ── 预处理参数（可通过 config.preprocess.xxx 修改）──
         self.preprocess_params = {
@@ -47,6 +51,16 @@ class CaliperPipeline:
         if image is not None:
             progress_callback(step_key, image, status)
 
+    def _start_timing(self):
+        return time.perf_counter()
+
+    def _record_timing(self, key: str, label: str, start_time: float):
+        self.timings[key] = {
+            'label': label,
+            'ms': (time.perf_counter() - start_time) * 1000.0,
+        }
+        self.step_results['timings'] = self.timings
+
     def run(self, img: np.ndarray, progress_callback=None) -> CaliperResult:
         """
         执行完整流水线
@@ -59,32 +73,83 @@ class CaliperPipeline:
         """
         self.debug_images = {}
         self.step_results = {}
+        self.timings = {}
+        self._pipeline_t0 = time.perf_counter()
         original = img.copy()
 
         # ═══════════════════════════════════════
         #  步骤 0: 图像预处理
         # ═══════════════════════════════════════
+        t0 = self._start_timing()
         roi_result = locate_roi_lowres(img)
+        self._record_timing('roi_lowres', '低分辨率 ROI 定位', t0)
+        roi_timing_labels = {
+            'gray_full': 'ROI: 原图转灰度',
+            'resize_gray_linear': 'ROI: 灰度 INTER_LINEAR 缩放',
+            'enhance_gamma_clahe': 'ROI: gamma/CLAHE',
+            'adaptive_threshold': 'ROI: 自适应二值化',
+            'horizontal_projection': 'ROI: 水平投影',
+            'vertical_projection': 'ROI: 垂直投影',
+            'refine_vernier_block': 'ROI: 游标本体精修',
+            'refine_make_edge_map': 'ROI: 精修生成 Sobel-Y 边缘图',
+            'refine_select_y_edge_window': 'ROI: 精修选择 y 边缘窗口',
+            'refine_find_y_edges': 'ROI: 精修查找上下边缘',
+            'refine_find_right_edge': 'ROI: 精修查找右边缘',
+            'refine_reading_window': 'ROI: 读数窗口精修',
+            'map_and_crop': 'ROI: 映射裁剪',
+        }
+        for sub_key, ms in roi_result.get('roi_timings', {}).items():
+            self.timings[f'roi_{sub_key}'] = {
+                'label': roi_timing_labels.get(sub_key, f'ROI: {sub_key}'),
+                'ms': float(ms),
+            }
+        self.step_results['timings'] = self.timings
         if roi_result['roi_color'] is None:
+            self._record_timing('total', '总耗时', self._pipeline_t0)
             return self._fail(original, "ROI 提取失败")
-        self.debug_images['1a_ROI定位'] = roi_result.get('lowres_debug')
+        if roi_result.get('lowres_debug') is not None:
+            self.debug_images['1a_ROI定位'] = roi_result.get('lowres_debug')
         self._emit_progress(progress_callback, '1a_ROI定位', 'ROI 定位完成')
 
-        pp = preprocess(roi_result['roi_color'], **self.preprocess_params)
+        t0 = self._start_timing()
+        pp = preprocess(roi_result['roi_color'], make_debug=not self.fast_mode, **self.preprocess_params)
+        self._record_timing('preprocess_roi', 'ROI 内正式预处理', t0)
+        preprocess_timing_labels = {
+            'gray': '预处理: 转灰度',
+            'gamma': '预处理: gamma',
+            'bilateral': '预处理: 双边滤波',
+            'median': '预处理: 中值滤波',
+            'clahe': '预处理: CLAHE',
+            'unsharp': '预处理: 锐化',
+            'adaptive_threshold': '预处理: 自适应二值化',
+            'morph_open': '预处理: 形态学开运算',
+            'cc_filter': '预处理: 连通域过滤',
+        }
+        for sub_key, ms in pp.get('step_timings', {}).items():
+            self.timings[f'preprocess_{sub_key}'] = {
+                'label': preprocess_timing_labels.get(sub_key, f'预处理: {sub_key}'),
+                'ms': float(ms),
+            }
+        self.step_results['timings'] = self.timings
         roi_result['roi_color'] = pp['color']
         roi_result['roi_gray'] = pp['enhanced']
         roi_result['roi_binary'] = pp['binary_adaptive']
-        self.debug_images['0_预处理'] = pp['debug_vis']
+        if pp.get('debug_vis') is not None:
+            self.debug_images['0_预处理'] = pp['debug_vis']
         self.step_results['preprocess'] = pp
         self._emit_progress(progress_callback, '0_预处理', '预处理完成')
         self.step_results['roi'] = roi_result
 
+        t0 = self._start_timing()
         orient_result = orient_caliper(
             roi_result['roi_color'],
             roi_result['roi_gray'],
-            roi_result['roi_binary']
+            roi_result['roi_binary'],
+            make_debug=not self.fast_mode
         )
-        self.debug_images['1b_方向校正'] = orient_result['orient_vis']
+        self._record_timing('orientation', '方向校正', t0)
+        if orient_result.get('orient_vis') is not None:
+            self.debug_images['1b_方向校正'] = orient_result['orient_vis']
         self.step_results['orient'] = orient_result
         self._emit_progress(progress_callback, '1b_方向校正', '方向校正完成')
         return self._run_remainder(original, orient_result, progress_callback)
@@ -98,8 +163,11 @@ class CaliperPipeline:
         rotated_binary = orient_result['rotated_binary']
 
         # 步骤 2
-        split_result = split_scales(rotated_gray, rotated_binary, rotated_color)
-        self.debug_images['2_区域分离'] = split_result['split_vis']
+        t0 = self._start_timing()
+        split_result = split_scales(rotated_gray, rotated_binary, rotated_color, make_debug=not self.fast_mode)
+        self._record_timing('region_split', '主尺/游标区域分离', t0)
+        if split_result.get('split_vis') is not None:
+            self.debug_images['2_区域分离'] = split_result['split_vis']
         self.step_results['split'] = split_result
         self._emit_progress(progress_callback, '2_区域分离', '区域分离完成')
         region_main = split_result['region_main']
@@ -108,49 +176,68 @@ class CaliperPipeline:
 
         # 步骤 3
         main_color = rotated_color[:split_y, :]
-        main_result = recognize_main_scale(region_main, main_color)
-        self.debug_images['3a_主尺刻度线'] = main_result['vis_ticks']
+        t0 = self._start_timing()
+        main_result = recognize_main_scale(region_main, main_color, make_debug=not self.fast_mode)
+        self._record_timing('main_scale', '主尺刻线识别', t0)
+        if main_result.get('vis_ticks') is not None:
+            self.debug_images['3a_主尺刻度线'] = main_result['vis_ticks']
         self.step_results['main'] = main_result
         self._emit_progress(progress_callback, '3a_主尺刻度线', '主尺刻线识别完成')
 
         # 步骤 4
         vernier_color = rotated_color[split_y:, :]
+        t0 = self._start_timing()
         vernier_result = recognize_vernier_scale(
             region_vernier, main_result['main_gap'], vernier_color,
-            main_result['main_ticks']
+            main_result['main_ticks'],
+            make_debug=not self.fast_mode
         )
+        self._record_timing('vernier_scale', '游标刻线识别与对齐', t0)
         # ── 生成零线验证概览 ──
-        overview = _make_zero_overview(rotated_color, main_result, vernier_result,
-                                        split_y, region_main, region_vernier)
-        self.debug_images['3a_主尺刻度线'] = overview
-        self._emit_progress(progress_callback, '3a_主尺刻度线', '零线总览完成')
-        self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
-        self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
-        # ── 对齐可视化：用整张 ROI 图（含主尺真实网格）──
-        vernier_result['vis_alignment'] = _regenerate_alignment_vis(
-            vernier_result, vernier_color, rotated_color,
-            split_y, main_result['main_ticks'], main_result['main_gap'])
-        self.debug_images['4c_游标对齐'] = vernier_result['vis_alignment']
+        if not self.fast_mode:
+            t0 = self._start_timing()
+            overview = _make_zero_overview(rotated_color, main_result, vernier_result,
+                                            split_y, region_main, region_vernier)
+            self._record_timing('zero_overview_vis', '零线总览图', t0)
+            self.debug_images['3a_主尺刻度线'] = overview
+            self._emit_progress(progress_callback, '3a_主尺刻度线', '零线总览完成')
+            self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
+            self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
+            # ── 对齐可视化：用整张 ROI 图（含主尺真实网格）──
+        if not self.fast_mode:
+            t0 = self._start_timing()
+            vernier_result['vis_alignment'] = _regenerate_alignment_vis(
+                vernier_result, vernier_color, rotated_color,
+                split_y, main_result['main_ticks'], main_result['main_gap'])
+            self._record_timing('alignment_vis', '游标对齐图', t0)
+            self.debug_images['4c_游标对齐'] = vernier_result['vis_alignment']
+            self._emit_progress(progress_callback, '4c_游标对齐', '游标对齐完成')
         self.step_results['vernier'] = vernier_result
-        self._emit_progress(progress_callback, '4c_游标对齐', '游标对齐完成')
-
-        # ── 添加图例（在对齐图重新生成之后）──
-        _add_legends(main_result, vernier_result)
-
+    
+        if not self.fast_mode:
+            t0 = self._start_timing()
+            _add_legends(main_result, vernier_result)
+            self._record_timing('legend_vis', '图例生成', t0)
+    
         # 步骤 5
+        t0 = self._start_timing()
         final = merge_readings(
             main_result, vernier_result,
-            rotated_color, region_main, region_vernier, split_y
+            rotated_color, region_main, region_vernier, split_y,
+            make_debug=not self.fast_mode
         )
-
-        # ── 生成 OCR 调试图（替换空白占位）──
-        ocr_debug_vis = _make_ocr_debug_vis(
-            rotated_color, split_y, region_main,
-            main_result, vernier_result, final)
-        if ocr_debug_vis is not None:
-            self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
-            self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
-
+        self._record_timing('merge_readings', '读数合并/OCR/最终标注', t0)
+    
+        if not self.fast_mode:
+            t0 = self._start_timing()
+            ocr_debug_vis = _make_ocr_debug_vis(
+                rotated_color, split_y, region_main,
+                main_result, vernier_result, final)
+            self._record_timing('ocr_debug_vis', 'OCR 调试图', t0)
+            if ocr_debug_vis is not None:
+                self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
+                self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
+    
         final.debug_images = self.debug_images
         self.debug_images['5_最终标注'] = final.image_annotated
         self._emit_progress(progress_callback, '5_最终标注', '最终标注完成')
@@ -159,9 +246,12 @@ class CaliperPipeline:
         if deriv_vis is not None:
             self.debug_images['5b_读数推导'] = deriv_vis
             self._emit_progress(progress_callback, '5b_读数推导', '读数推导完成')
-
+    
+        self._record_timing('total', '总耗时', self._pipeline_t0)
+        final.extra_info['timings'] = self.timings.copy()
+        self.step_results['timings'] = self.timings
         return final
-
+    
     def _fail(self, img: np.ndarray, reason: str) -> CaliperResult:
         """生成失败结果"""
         result = CaliperResult(
@@ -172,11 +262,11 @@ class CaliperPipeline:
             confidence=0.0,
             image_annotated=img,
             debug_images={'error': img},
-            extra_info={'error': reason},
+            extra_info={'error': reason, 'timings': self.timings.copy()},
         )
         return result
-
-
+    
+    
 # ═══════════════════════════════════════════════════
 #  图例 & 概览辅助函数
 # ═══════════════════════════════════════════════════

@@ -7,6 +7,7 @@
 
 import cv2
 import numpy as np
+import time
 from typing import List
 
 from .result import CaliperResult, DigitInfo
@@ -17,7 +18,8 @@ def merge_readings(main_result: dict,
                     rotated_color: np.ndarray,
                     region_main: dict,
                     region_vernier: dict,
-                    split_y: int) -> CaliperResult:
+                    split_y: int,
+                    make_debug: bool = True) -> CaliperResult:
     """
     合并主尺和游标尺读数，生成最终结果
 
@@ -40,15 +42,24 @@ def merge_readings(main_result: dict,
     precision = vernier_result['precision']
     vernier_reading = vernier_result['vernier_reading']
     zero_x = vernier_result['zero_x']
+    merge_timings = {}
+
+    def mark(key: str, label: str, start_time: float):
+        merge_timings[key] = {
+            'label': label,
+            'ms': (time.perf_counter() - start_time) * 1000.0,
+        }
 
     # v6.5: 传 gray + binary 给 merger 让它做定向 OCR
     main_gray = region_main.get('image')
     main_binary = region_main.get('binary')
 
     # ── 计算主尺整数读数（附带推导诊断信息）──
+    t0 = time.perf_counter()
     main_reading, main_derivation = _compute_main_reading_with_info(
         main_ticks, main_digits, main_gap, zero_x,
         gray_region=main_gray, binary_region=main_binary)
+    mark('main_ocr_reading', '主尺 OCR 与整数读数', t0)
 
     # ── 游标对齐索引 ──
     aligned_tick = vernier_result.get('aligned_tick')
@@ -67,6 +78,7 @@ def merge_readings(main_result: dict,
     confidence = calc_confidence(main_ticks, vernier_ticks, precision)
 
     # ── 最终标注图（含读数推导可视化）──
+    t0 = time.perf_counter()
     annotated = draw_final_annotation(
         rotated_color, region_main, region_vernier,
         main_ticks, vernier_ticks, main_gap, split_y,
@@ -74,16 +86,21 @@ def merge_readings(main_result: dict,
         zero_x, aligned_tick, main_digits, vernier_digits,
         main_derivation, vernier_aligned_idx
     )
+    mark('final_annotation', '最终标注图', t0)
 
     # ── 读数推导专用可视化（单独一张调试图像）──
-    derivation_vis = draw_reading_derivation(
-        rotated_color, region_main, region_vernier,
-        main_ticks, vernier_ticks, main_gap, split_y,
-        main_reading, vernier_reading, total, precision,
-        zero_x, aligned_tick, main_digits,
-        main_derivation, vernier_aligned_idx,
-        vernier_result.get('alignment_confidence', 0.0)
-    )
+    derivation_vis = None
+    if make_debug:
+        t0 = time.perf_counter()
+        derivation_vis = draw_reading_derivation(
+            rotated_color, region_main, region_vernier,
+            main_ticks, vernier_ticks, main_gap, split_y,
+            main_reading, vernier_reading, total, precision,
+            zero_x, aligned_tick, main_digits,
+            main_derivation, vernier_aligned_idx,
+            vernier_result.get('alignment_confidence', 0.0)
+        )
+        mark('derivation_vis', '读数推导图', t0)
 
     return CaliperResult(
         main_scale=main_reading,
@@ -100,6 +117,7 @@ def merge_readings(main_result: dict,
             'main_digits': [(d.text, d.value, d.x) for d in main_digits],
             'main_derivation': main_derivation,
             'derivation_vis': derivation_vis,
+            'merge_timings': merge_timings,
         },
     )
 
@@ -145,27 +163,43 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
                                      gray_region: np.ndarray = None,
                                      binary_region: np.ndarray = None,
                                      main_color_region: np.ndarray = None) -> tuple:
+    ocr_timings = {}
+
+    def mark(key: str, start_time: float):
+        ocr_timings[key] = (time.perf_counter() - start_time) * 1000.0
+
     if main_gap <= 0:
         return _ocr_failed_reading('invalid_main_gap')
 
+    t0 = time.perf_counter()
     main_xs = _dedupe_main_xs([t['x'] for t in main_ticks], main_gap) if main_ticks else []
+    mark('dedupe_main_ticks', t0)
 
     if main_xs and zero_x > 0 and gray_region is not None and binary_region is not None:
+        t0 = time.perf_counter()
         from .ocr import get_ocr_reader_singleton
         from .main_scale import find_nearest_cm_digit_region, find_digit_cc_candidates
+        mark('import_ocr_helpers', t0)
 
+        t0 = time.perf_counter()
         binary_crop, x_off, y_off = find_nearest_cm_digit_region(
             main_ticks, main_gap, zero_x, binary_region)
+        mark('find_digit_region', t0)
         if binary_crop is None:
             return _ocr_failed_reading('no_digit_region')
 
+        t0 = time.perf_counter()
         cc_candidates = find_digit_cc_candidates(binary_crop, x_off, y_off, zero_x)
+        mark('find_digit_cc_candidates', t0)
         if not cc_candidates:
             return _ocr_failed_reading('no_digit_component')
 
+        t0 = time.perf_counter()
         reader = get_ocr_reader_singleton()
         engine = reader.engine_status() if hasattr(reader, 'engine_status') else reader.engine_name()
+        mark('get_ocr_reader', t0)
         char_candidates = []
+        t0 = time.perf_counter()
         for cc in cc_candidates:
             digit = reader.ocr_patch_to_digit(cc['digit_crop'], cc['bbox'], gray_region)
             if digit is None or digit.value < 0:
@@ -180,11 +214,15 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
                 'center_x': cc['center_x'],
                 'source': 'single_char',
             })
+        mark('ocr_digit_patches', t0)
 
+        t0 = time.perf_counter()
         ocr_candidates = _group_main_ocr_labels(char_candidates, main_ticks, main_gap)
+        mark('group_ocr_labels', t0)
         if not ocr_candidates:
             return _ocr_failed_reading('ocr_no_digit', ocr_engine=engine)
 
+        t0 = time.perf_counter()
         side_tol = max(4.0, main_gap * 0.20)
         usable = [c for c in ocr_candidates if c['ref_tick_x'] <= zero_x + side_tol]
         if not usable:
@@ -197,6 +235,7 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
         ref_x = selected['ref_tick_x']
         extra_ticks = sum(1 for x in main_xs if ref_x + main_gap * 0.3 < x <= zero_x)
         reading = float(digit.value) * 10 + extra_ticks
+        mark('select_and_compute', t0)
         return reading, {
             'nearest_digit': digit,
             'extra_ticks': extra_ticks,
@@ -206,6 +245,7 @@ def _compute_main_reading_with_info(main_ticks: List[dict],
             'ocr_confidence': digit.confidence,
             'ocr_engine': engine,
             'ocr_candidates': _summarize_ocr_candidates(ocr_candidates, selected),
+            'ocr_timings': ocr_timings,
         }
 
     return _ocr_failed_reading('missing_ocr_inputs')

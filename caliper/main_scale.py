@@ -20,7 +20,8 @@ from .config import config
 
 
 def recognize_main_scale(region: dict,
-                          color_region: np.ndarray = None) -> dict:
+                          color_region: np.ndarray = None,
+                          make_debug: bool = True) -> dict:
     """
     主尺识别主函数
 
@@ -95,7 +96,7 @@ def recognize_main_scale(region: dict,
     main_reading = 0.0
 
     # ── 可视化 ──
-    vis_ticks = _draw_main_ticks(region, binary, main_ticks, vproj_norm, main_xs)
+    vis_ticks = _draw_main_ticks(region, binary, main_ticks, vproj_norm, main_xs) if make_debug else None
 
     return {
         'main_ticks': main_ticks,

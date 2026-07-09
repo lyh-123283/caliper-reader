@@ -5,6 +5,7 @@
 import os
 import cv2
 import numpy as np
+import time
 from PIL import Image, ImageDraw, ImageFont
 from .config import config
 
@@ -14,7 +15,8 @@ def preprocess(img: np.ndarray,
                bilateral_d: int = None,
                bilateral_sigma: float = None,
                gamma: float = None,
-               median_ksize: int = None) -> dict:
+               median_ksize: int = None,
+               make_debug: bool = True) -> dict:
     """
     图像预处理主函数
 
@@ -47,49 +49,99 @@ def preprocess(img: np.ndarray,
         median_ksize = config.preprocess.median_ksize
     result = {'color': img.copy()}
     intermediates = {}
+    timings = {}
 
+    def mark(key: str, start_time: float):
+        timings[key] = (time.perf_counter() - start_time) * 1000.0
+
+    t0 = time.perf_counter()
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    mark('gray', t0)
     result['gray'] = gray
-    intermediates['01_gray'] = gray
+    if make_debug:
+        intermediates['01_gray'] = gray
 
+    t0 = time.perf_counter()
     if gamma != 1.0:
         inv_gamma = 1.0 / gamma
         table = np.array(
             [((i / 255.0) ** inv_gamma) * 255 for i in range(256)]
         ).astype(np.uint8)
         gray = cv2.LUT(gray, table)
-    intermediates['02_gamma'] = gray.copy()
+    mark('gamma', t0)
+    if make_debug:
+        intermediates['02_gamma'] = gray.copy()
 
+    t0 = time.perf_counter()
     denoised = cv2.bilateralFilter(gray, bilateral_d, bilateral_sigma, bilateral_sigma)
-    intermediates['03_bilateral'] = denoised.copy()
+    mark('bilateral', t0)
+    if make_debug:
+        intermediates['03_bilateral'] = denoised.copy()
 
+    t0 = time.perf_counter()
     if median_ksize >= 3:
         ksize = median_ksize if median_ksize % 2 == 1 else median_ksize + 1
         denoised = cv2.medianBlur(denoised, ksize)
-        intermediates['04_median'] = denoised.copy()
+        if make_debug:
+            intermediates['04_median'] = denoised.copy()
+    mark('median', t0)
 
+    t0 = time.perf_counter()
     clahe = cv2.createCLAHE(
         clipLimit=clip_limit,
         tileGridSize=(config.preprocess.clahe_tile_w, config.preprocess.clahe_tile_h))
     enhanced = clahe.apply(denoised)
-    intermediates['05_clahe'] = enhanced.copy()
+    mark('clahe', t0)
+    if make_debug:
+        intermediates['05_clahe'] = enhanced.copy()
 
+    t0 = time.perf_counter()
     if config.preprocess.unsharp_amount > 0.01:
         blur = cv2.GaussianBlur(enhanced, (0, 0), config.preprocess.unsharp_blur_sigma)
         a = config.preprocess.unsharp_amount
         enhanced = cv2.addWeighted(enhanced, 1.0 + a, blur, -a, 0)
-    intermediates['06_unsharp'] = enhanced.copy()
+    mark('unsharp', t0)
+    if make_debug:
+        intermediates['06_unsharp'] = enhanced.copy()
     result['enhanced'] = enhanced
 
-    binary_adaptive = cv2.adaptiveThreshold(
-        enhanced, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=config.preprocess.adaptive_block_size,
-        C=config.preprocess.adaptive_C
-    )
-    intermediates['07_adaptive_bin'] = binary_adaptive.copy()
+    t0 = time.perf_counter()
+    binary_scale = float(getattr(config.preprocess, 'adaptive_binary_scale', 1.0) or 1.0)
+    if 0 < binary_scale < 0.999:
+        h, w = enhanced.shape[:2]
+        small_w = max(1, int(round(w * binary_scale)))
+        small_h = max(1, int(round(h * binary_scale)))
+        enhanced_for_binary = cv2.resize(
+            enhanced, (small_w, small_h), interpolation=cv2.INTER_AREA)
+        block_size = max(3, int(round(config.preprocess.adaptive_block_size * binary_scale)))
+        if block_size % 2 == 0:
+            block_size += 1
+        max_block = min(small_h, small_w)
+        if max_block % 2 == 0:
+            max_block -= 1
+        block_size = min(block_size, max(3, max_block))
+        binary_small = cv2.adaptiveThreshold(
+            enhanced_for_binary, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=block_size,
+            C=config.preprocess.adaptive_C
+        )
+        binary_adaptive = cv2.resize(
+            binary_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    else:
+        binary_adaptive = cv2.adaptiveThreshold(
+            enhanced, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=config.preprocess.adaptive_block_size,
+            C=config.preprocess.adaptive_C
+        )
+    mark('adaptive_threshold', t0)
+    if make_debug:
+        intermediates['07_adaptive_bin'] = binary_adaptive.copy()
 
+    t0 = time.perf_counter()
     if config.preprocess.morph_open_enabled:
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
@@ -99,18 +151,24 @@ def preprocess(img: np.ndarray,
             binary_adaptive, cv2.MORPH_OPEN, kernel,
             iterations=config.preprocess.morph_open_iterations,
         )
-    intermediates['08_morph_open'] = binary_adaptive.copy()
+    mark('morph_open', t0)
+    if make_debug:
+        intermediates['08_morph_open'] = binary_adaptive.copy()
 
+    t0 = time.perf_counter()
     if config.preprocess.cc_filter_enabled:
         min_area = config.preprocess.cc_min_area
         binary_adaptive = _filter_small_components_by_contour(
             binary_adaptive, min_area)
+    mark('cc_filter', t0)
 
-    intermediates['09_cc_filter'] = binary_adaptive.copy()
+    if make_debug:
+        intermediates['09_cc_filter'] = binary_adaptive.copy()
     result['binary_adaptive'] = binary_adaptive
 
     result['intermediates'] = intermediates
-    result['debug_vis'] = _make_preprocess_vis(img, intermediates, gamma, median_ksize)
+    result['step_timings'] = timings
+    result['debug_vis'] = _make_preprocess_vis(img, intermediates, gamma, median_ksize) if make_debug else None
 
     return result
 
