@@ -1,32 +1,25 @@
 """
-流水线主控 — 串联所有步骤
-
-流水线:
-  步骤 0: 图像预处理（增强 + 滤波 + 二值化）
-  步骤 1: ROI提取 + 方向矫正
-  步骤 2: 区域分离（主尺 / 游标尺）
-  步骤 3: 主尺识别（刻度线 + 数字OCR）
-  步骤 4: 游标尺识别（刻度线 + 对齐 + 数字OCR）
-  步骤 5: 读数合并 + 最终标注
+游标卡尺识别流水线主控。
 """
+
+import time
 
 import cv2
 import numpy as np
-import time
 
-from .result import CaliperResult
-from .preprocess import preprocess
-from .roi_extract import locate_roi_lowres, orient_caliper
-from .region_split import split_scales
-from .main_scale import recognize_main_scale
-from .vernier_scale import recognize_vernier_scale
-from .merger import merge_readings
-from .utils import draw_legend_below, draw_projection_plot
 from .config import config
+from .main_scale import recognize_main_scale
+from .merger import merge_readings
+from .preprocess import preprocess
+from .region_split import split_scales
+from .result import CaliperResult
+from .roi_extract import locate_roi_lowres, orient_caliper
+from .utils import draw_legend_below, draw_projection_plot
+from .vernier_scale import recognize_vernier_scale
 
 
 class CaliperPipeline:
-    """游标卡尺识别流水线"""
+    """游标卡尺识别流水线。"""
 
     def __init__(self, fast_mode: bool = False):
         self.debug_images = {}
@@ -35,7 +28,6 @@ class CaliperPipeline:
         self._pipeline_t0 = 0.0
         self.fast_mode = fast_mode
 
-        # ── 预处理参数（可通过 config.preprocess.xxx 修改）──
         self.preprocess_params = {
             'clip_limit': config.preprocess.clahe_clip_limit,
             'bilateral_d': config.preprocess.bilateral_d,
@@ -62,39 +54,34 @@ class CaliperPipeline:
         self.step_results['timings'] = self.timings
 
     def run(self, img: np.ndarray, progress_callback=None) -> CaliperResult:
-        """
-        执行完整流水线
-
-        Args:
-            img: BGR 彩色图像 (numpy array)
-
-        Returns:
-            CaliperResult 识别结果（含所有中间调试图像）
-        """
         self.debug_images = {}
         self.step_results = {}
         self.timings = {}
         self._pipeline_t0 = time.perf_counter()
         original = img.copy()
 
-        # ═══════════════════════════════════════
-        #  步骤 0: 图像预处理
-        # ═══════════════════════════════════════
         t0 = self._start_timing()
         roi_result = locate_roi_lowres(img)
-        self._record_timing('roi_lowres', '低分辨率 ROI 定位', t0)
+        self._record_timing('roi_lowres', 'ROI 定位', t0)
         roi_timing_labels = {
+            'template_resize_gray': 'ROI: 模板缩放/灰度化',
+            'template_match': 'ROI: 螺丝模板匹配',
+            'template_geometry': 'ROI: 螺丝几何组合',
+            'template_match_fallback': 'ROI: 多尺度模板匹配',
+            'template_geometry_fallback': 'ROI: 多尺度几何组合',
+            'template_map_and_crop': 'ROI: 模板映射裁剪',
+            'roi_debug_vis': 'ROI: 定位可视化',
             'gray_full': 'ROI: 原图转灰度',
-            'resize_gray_linear': 'ROI: 灰度 INTER_LINEAR 缩放',
+            'resize_gray_linear': 'ROI: 灰度缩放',
             'enhance_gamma_clahe': 'ROI: gamma/CLAHE',
             'adaptive_threshold': 'ROI: 自适应二值化',
             'horizontal_projection': 'ROI: 水平投影',
             'vertical_projection': 'ROI: 垂直投影',
             'refine_vernier_block': 'ROI: 游标本体精修',
-            'refine_make_edge_map': 'ROI: 精修生成 Sobel-Y 边缘图',
-            'refine_select_y_edge_window': 'ROI: 精修选择 y 边缘窗口',
-            'refine_find_y_edges': 'ROI: 精修查找上下边缘',
-            'refine_find_right_edge': 'ROI: 精修查找右边缘',
+            'refine_make_edge_map': 'ROI: 生成边缘图',
+            'refine_select_y_edge_window': 'ROI: 选择 y 边缘窗口',
+            'refine_find_y_edges': 'ROI: 查找上下边缘',
+            'refine_find_right_edge': 'ROI: 查找右边缘',
             'refine_reading_window': 'ROI: 读数窗口精修',
             'map_and_crop': 'ROI: 映射裁剪',
         }
@@ -106,10 +93,15 @@ class CaliperPipeline:
         self.step_results['timings'] = self.timings
         if roi_result['roi_color'] is None:
             self._record_timing('total', '总耗时', self._pipeline_t0)
-            return self._fail(original, "ROI 提取失败")
+            return self._fail(original, 'ROI 提取失败')
+
+        roi_source_label = {
+            'screw_template': '螺丝模板匹配',
+            'lowres_projection': '低分辨率投影',
+        }.get(roi_result.get('roi_source'), 'ROI 定位')
         if roi_result.get('lowres_debug') is not None:
-            self.debug_images['1a_ROI定位'] = roi_result.get('lowres_debug')
-        self._emit_progress(progress_callback, '1a_ROI定位', 'ROI 定位完成')
+            self.debug_images['1_ROI定位'] = roi_result.get('lowres_debug')
+        self._emit_progress(progress_callback, '1_ROI定位', f'ROI 定位完成：{roi_source_label}')
 
         t0 = self._start_timing()
         pp = preprocess(roi_result['roi_color'], make_debug=not self.fast_mode, **self.preprocess_params)
@@ -145,7 +137,7 @@ class CaliperPipeline:
             roi_result['roi_color'],
             roi_result['roi_gray'],
             roi_result['roi_binary'],
-            make_debug=not self.fast_mode
+            make_debug=not self.fast_mode,
         )
         self._record_timing('orientation', '方向校正', t0)
         if orient_result.get('orient_vis') is not None:
@@ -157,12 +149,10 @@ class CaliperPipeline:
     def _run_remainder(self, original: np.ndarray,
                        orient_result: dict,
                        progress_callback=None) -> CaliperResult:
-        """执行流水线剩余部分（步骤 2~5）。"""
         rotated_color = orient_result['rotated_color']
         rotated_gray = orient_result['rotated_gray']
         rotated_binary = orient_result['rotated_binary']
 
-        # 步骤 2
         t0 = self._start_timing()
         split_result = split_scales(rotated_gray, rotated_binary, rotated_color, make_debug=not self.fast_mode)
         self._record_timing('region_split', '主尺/游标区域分离', t0)
@@ -174,7 +164,6 @@ class CaliperPipeline:
         region_vernier = split_result['region_vernier']
         split_y = split_result['split_y']
 
-        # 步骤 3
         main_color = rotated_color[:split_y, :]
         t0 = self._start_timing()
         main_result = recognize_main_scale(region_main, main_color, make_debug=not self.fast_mode)
@@ -184,76 +173,110 @@ class CaliperPipeline:
         self.step_results['main'] = main_result
         self._emit_progress(progress_callback, '3a_主尺刻度线', '主尺刻线识别完成')
 
-        # 步骤 4
         vernier_color = rotated_color[split_y:, :]
         t0 = self._start_timing()
         vernier_result = recognize_vernier_scale(
-            region_vernier, main_result['main_gap'], vernier_color,
+            region_vernier,
+            main_result['main_gap'],
+            vernier_color,
             main_result['main_ticks'],
-            make_debug=not self.fast_mode
+            make_debug=not self.fast_mode,
         )
         self._record_timing('vernier_scale', '游标刻线识别与对齐', t0)
-        # ── 生成零线验证概览 ──
+
         if not self.fast_mode:
             t0 = self._start_timing()
-            overview = _make_zero_overview(rotated_color, main_result, vernier_result,
-                                            split_y, region_main, region_vernier)
+            overview = _make_zero_overview(
+                rotated_color,
+                main_result,
+                vernier_result,
+                split_y,
+                region_main,
+                region_vernier,
+            )
             self._record_timing('zero_overview_vis', '零线总览图', t0)
-            self.debug_images['3a_主尺刻度线'] = overview
-            self._emit_progress(progress_callback, '3a_主尺刻度线', '零线总览完成')
-            self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
-            self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
-            # ── 对齐可视化：用整张 ROI 图（含主尺真实网格）──
+            self.debug_images['3c_零线总览'] = overview
+            self._emit_progress(progress_callback, '3c_零线总览', '零线总览完成')
+            if vernier_result.get('vis_ticks') is not None:
+                self.debug_images['4b_游标刻度线'] = vernier_result['vis_ticks']
+                self._emit_progress(progress_callback, '4b_游标刻度线', '游标刻线识别完成')
+
         if not self.fast_mode:
             t0 = self._start_timing()
             vernier_result['vis_alignment'] = _regenerate_alignment_vis(
-                vernier_result, vernier_color, rotated_color,
-                split_y, main_result['main_ticks'], main_result['main_gap'])
+                vernier_result,
+                vernier_color,
+                rotated_color,
+                split_y,
+                main_result['main_ticks'],
+                main_result['main_gap'],
+            )
             self._record_timing('alignment_vis', '游标对齐图', t0)
             self.debug_images['4c_游标对齐'] = vernier_result['vis_alignment']
             self._emit_progress(progress_callback, '4c_游标对齐', '游标对齐完成')
         self.step_results['vernier'] = vernier_result
-    
+
         if not self.fast_mode:
             t0 = self._start_timing()
             _add_legends(main_result, vernier_result)
             self._record_timing('legend_vis', '图例生成', t0)
-    
-        # 步骤 5
+
         t0 = self._start_timing()
         final = merge_readings(
-            main_result, vernier_result,
-            rotated_color, region_main, region_vernier, split_y,
-            make_debug=not self.fast_mode
+            main_result,
+            vernier_result,
+            rotated_color,
+            region_main,
+            region_vernier,
+            split_y,
+            make_debug=not self.fast_mode,
+            simple_annotation=self.fast_mode,
         )
+        roi_info = self.step_results.get('roi', {})
+        final.extra_info.update({
+            'roi_source': roi_info.get('roi_source', 'lowres_projection'),
+            'roi_box_original': roi_info.get('roi_box_original'),
+            'fast_mode': bool(self.fast_mode),
+            'speed_strategies': {
+                'roi_template_matching': roi_info.get('roi_source') == 'screw_template',
+                'reuse_region_binary': True,
+                'simple_final_annotation': bool(self.fast_mode),
+                'seam_near_main_refine': True,
+                'seam_near_vernier_refine': True,
+            },
+        })
         self._record_timing('merge_readings', '读数合并/OCR/最终标注', t0)
-    
+
         if not self.fast_mode:
             t0 = self._start_timing()
             ocr_debug_vis = _make_ocr_debug_vis(
-                rotated_color, split_y, region_main,
-                main_result, vernier_result, final)
+                rotated_color,
+                split_y,
+                region_main,
+                main_result,
+                vernier_result,
+                final,
+            )
             self._record_timing('ocr_debug_vis', 'OCR 调试图', t0)
             if ocr_debug_vis is not None:
                 self.debug_images['3b_主尺数字OCR'] = ocr_debug_vis
                 self._emit_progress(progress_callback, '3b_主尺数字OCR', 'OCR 调试图完成')
-    
+
         final.debug_images = self.debug_images
         self.debug_images['5_最终标注'] = final.image_annotated
         self._emit_progress(progress_callback, '5_最终标注', '最终标注完成')
-        # 添加读数推导可视化
+
         deriv_vis = final.extra_info.get('derivation_vis')
         if deriv_vis is not None:
             self.debug_images['5b_读数推导'] = deriv_vis
             self._emit_progress(progress_callback, '5b_读数推导', '读数推导完成')
-    
+
         self._record_timing('total', '总耗时', self._pipeline_t0)
         final.extra_info['timings'] = self.timings.copy()
         self.step_results['timings'] = self.timings
         return final
-    
+
     def _fail(self, img: np.ndarray, reason: str) -> CaliperResult:
-        """生成失败结果"""
         result = CaliperResult(
             main_scale=0.0,
             vernier_scale=0.0,
@@ -265,23 +288,18 @@ class CaliperPipeline:
             extra_info={'error': reason, 'timings': self.timings.copy()},
         )
         return result
-    
-    
-# ═══════════════════════════════════════════════════
-#  图例 & 概览辅助函数
-# ═══════════════════════════════════════════════════
+
 
 def _regenerate_alignment_vis(vernier_result: dict,
-                                vernier_color: np.ndarray,
-                                rotated_color: np.ndarray,
-                                split_y: int,
-                                main_ticks: list,
-                                main_gap: float) -> np.ndarray:
-    """用整张 ROI 彩色图重新生成对齐可视化（含主尺真实网格线）"""
+                              vernier_color: np.ndarray,
+                              rotated_color: np.ndarray,
+                              split_y: int,
+                              main_ticks: list,
+                              main_gap: float) -> np.ndarray:
     from .vernier_scale import _draw_alignment
     return _draw_alignment(
         {'y_offset': split_y},
-        vernier_color,               # color_region 回退
+        vernier_color,
         vernier_result['vernier_ticks'],
         main_gap,
         vernier_result['zero_x'],
@@ -294,8 +312,6 @@ def _regenerate_alignment_vis(vernier_result: dict,
 
 
 def _add_legends(main_result: dict, vernier_result: dict):
-    """在关键可视化图像下方添加中文图例面板"""
-    # ── 游标刻度线图 ──
     vis_vt = vernier_result.get('vis_ticks')
     if vis_vt is not None and vis_vt.size > 0:
         items = [
@@ -304,7 +320,6 @@ def _add_legends(main_result: dict, vernier_result: dict):
         ]
         vernier_result['vis_ticks'] = draw_legend_below(vis_vt, items)
 
-    # ── 游标对齐图 ──
     vis_va = vernier_result.get('vis_alignment')
     if vis_va is not None and vis_va.size > 0:
         items = [
@@ -316,24 +331,16 @@ def _add_legends(main_result: dict, vernier_result: dict):
         ]
         vernier_result['vis_alignment'] = draw_legend_below(vis_va, items)
 
-    # ── 主尺数字OCR图（图例稍后由 _make_ocr_debug_vis 自行处理）──
-
 
 def _make_ocr_debug_vis(rotated_color: np.ndarray,
-                         split_y: int,
-                         region_main: dict,
-                         main_result: dict,
-                         vernier_result: dict,
-                         final_result) -> np.ndarray:
-    """生成主尺 OCR 调试图 — 三合一纵向拼接：
-       上: 主尺彩色图 + 备选区红框 + 零线黄线
-       中: 备选区裁出 blow up
-       下: 连通域筛选 + OCR 结果
-    """
+                        split_y: int,
+                        region_main: dict,
+                        main_result: dict,
+                        vernier_result: dict,
+                        final_result) -> np.ndarray:
     from .main_scale import find_nearest_cm_digit_region
 
     main_color = rotated_color[:split_y, :]
-    main_gray = region_main.get('image')
     main_binary = region_main.get('binary')
     main_ticks = main_result.get('main_ticks', [])
     main_gap = main_result.get('main_gap', 0)
@@ -343,25 +350,27 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     if H_main < 10 or W_main < 10:
         return None
 
-    # ── 1. 获取备选区 ──
     binary_crop, x_off, y_off = find_nearest_cm_digit_region(
-        main_ticks, main_gap, zero_x, main_binary)
+        main_ticks,
+        main_gap,
+        zero_x,
+        main_binary,
+    )
     if binary_crop is None or binary_crop.size == 0:
-        # 退化：只显示主尺 + 零线
         fallback = main_color.copy()
-        cv2.line(fallback, (int(zero_x), 0), (int(zero_x), H_main - 1),
-                 (0, 255, 255), 2)
-        cv2.putText(fallback, "NO BACKUP REGION", (10, H_main - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 255), 1)
+        cv2.line(fallback, (int(zero_x), 0), (int(zero_x), H_main - 1), (0, 255, 255), 2)
+        cv2.putText(
+            fallback,
+            "NO BACKUP REGION",
+            (10, H_main - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (100, 100, 255),
+            1,
+        )
         return fallback
 
     ch, cw = binary_crop.shape
-
-    # ── 2. 连通域筛选 ──
-
-    # ── 3. OCR ──
-
-    # ── 4. 策略信息（从 final_result 取）──
     extra = final_result.extra_info if final_result else {}
     main_deriv = extra.get('main_derivation', {}) if hasattr(final_result, 'extra_info') else {}
     strategy = main_deriv.get('strategy', '?') if isinstance(main_deriv, dict) else '?'
@@ -372,7 +381,8 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     if selected_candidates:
         selected = selected_candidates[0]
         ocr_line = "OCR => '{}' ref_x={}".format(
-            selected.get('text'), int(round(float(selected.get('ref_tick_x', 0))))
+            selected.get('text'),
+            int(round(float(selected.get('ref_tick_x', 0)))),
         )
         ocr_color = (0, 255, 100)
     elif ocr_candidates:
@@ -382,45 +392,56 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         ocr_line = "OCR => no candidate"
         ocr_color = (100, 100, 255)
 
-    # ═══════════════════════════════════
-    #  Panel A: 主尺彩色 + 红框 + 零线
-    # ═══════════════════════════════════
     panel_a = main_color.copy()
-    # 刻度线（半透明绿）
     for t in main_ticks:
-        cv2.line(panel_a, (t['x'], max(0, t.get('y_start', 0))),
-                 (t['x'], min(H_main - 1, t.get('y_end', H_main))), (0, 160, 60), 1)
-    # 零线（黄色粗线）
+        cv2.line(
+            panel_a,
+            (t['x'], max(0, t.get('y_start', 0))),
+            (t['x'], min(H_main - 1, t.get('y_end', H_main))),
+            (0, 160, 60),
+            1,
+        )
     cv2.line(panel_a, (int(zero_x), 0), (int(zero_x), H_main - 1), (0, 255, 255), 2)
-    cv2.putText(panel_a, f"ZERO x={int(zero_x)}", (int(zero_x) + 4, 16),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-    # 备选区红框
+    cv2.putText(
+        panel_a,
+        f"ZERO x={int(zero_x)}",
+        (int(zero_x) + 4, 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 255, 255),
+        1,
+    )
     cv2.rectangle(panel_a, (x_off, y_off), (x_off + cw, y_off + ch), (0, 0, 255), 2)
-    cv2.putText(panel_a, f"backup ({cw}x{ch})", (x_off + 3, y_off + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 255), 1)
+    cv2.putText(
+        panel_a,
+        f"backup ({cw}x{ch})",
+        (x_off + 3, y_off + 14),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (0, 0, 255),
+        1,
+    )
 
-    # y_top_tick 线（青蓝色虚线），即 max(y_start)
     y_top_tick = max(t.get('y_start', 0) for t in main_ticks) if main_ticks else 0
     for x in range(0, W_main, 10):
-        x2 = min(W_main, x + 5)
-        cv2.line(panel_a, (x, y_top_tick), (x2, y_top_tick), (255, 200, 50), 1)
-    cv2.putText(panel_a, f"y_top_tick={y_top_tick} (max y_start)", (4, y_top_tick - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 200, 50), 1)
+        cv2.line(panel_a, (x, y_top_tick), (min(W_main, x + 5), y_top_tick), (255, 200, 50), 1)
+    cv2.putText(
+        panel_a,
+        f"y_top_tick={y_top_tick}",
+        (4, max(12, y_top_tick - 6)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.35,
+        (255, 200, 50),
+        1,
+    )
 
-    # ═══════════════════════════════════
-    #  Panel B: 备选区 blow up 4x
-    # ═══════════════════════════════════
     blow = cv2.resize(binary_crop, (cw * 4, ch * 4), interpolation=cv2.INTER_NEAREST)
     panel_b = cv2.cvtColor(blow, cv2.COLOR_GRAY2BGR)
 
-    # ═══════════════════════════════════
-    #  Panel C: 备选区彩色底 + 连通域框 + OCR
-    # ═══════════════════════════════════
     panel_c = main_color[y_off:y_off + ch, x_off:x_off + cw].copy()
     if len(panel_c.shape) == 2:
         panel_c = cv2.cvtColor(panel_c, cv2.COLOR_GRAY2BGR)
 
-    # 所有连通域（蓝色细框 + 面积标注）
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(binary_crop, connectivity=8)
     for j in range(1, num_labels):
         x = int(stats[j, cv2.CC_STAT_LEFT])
@@ -429,12 +450,10 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         h_cc = int(stats[j, cv2.CC_STAT_HEIGHT])
         area = int(stats[j, cv2.CC_STAT_AREA])
         cv2.rectangle(panel_c, (x, y), (x + w_cc, y + h_cc), (255, 140, 40), 1)
-        # 只标面积 > 10 的
         if area > 10:
             cv2.putText(panel_c, f"{area}", (x, max(y - 1, 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.22, (255, 140, 40), 1)
 
-    # 选中连通域（绿色粗框）
     if sel_bbox is not None:
         bx1 = sel_bbox[0] - x_off
         by1 = sel_bbox[1] - y_off
@@ -442,17 +461,8 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         by2 = sel_bbox[3] - y_off
         cv2.rectangle(panel_c, (bx1, by1), (bx2, by2), (0, 255, 100), 3)
 
-    # OCR 结果文字
-    # ═══════════════════════════════════
-    #  纵向拼接三面板
-    # ═══════════════════════════════════
     gap = 3
     panel_w = max(W_main, cw * 4)
-
-    # Panel A 保持原宽
-    pa = panel_a
-
-    # Panel B 可能需要 pad 到 panel_w
     if panel_b.shape[1] < panel_w:
         pb = np.zeros((panel_b.shape[0], panel_w, 3), dtype=np.uint8)
         pb[:] = (20, 20, 25)
@@ -460,7 +470,6 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     else:
         pb = panel_b
 
-    # Panel C
     if panel_c.shape[1] < panel_w:
         pc = np.zeros((panel_c.shape[0], panel_w, 3), dtype=np.uint8)
         pc[:] = (20, 20, 25)
@@ -468,34 +477,26 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
     else:
         pc = panel_c
 
-    # 面板标题
     label_h = 20
     total_h = (H_main + gap) + (label_h + pb.shape[0] + gap) + (label_h + pc.shape[0] + gap) + 36
     combined = np.zeros((total_h, panel_w, 3), dtype=np.uint8)
     combined[:] = (22, 22, 28)
 
     y = 0
-    # A
-    combined[y:y + H_main, :W_main] = pa
+    combined[y:y + H_main, :W_main] = panel_a
     cv2.putText(combined, "A: Main Scale + Backup Region (red) + Zero (yellow)",
                 (4, y + H_main - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (140, 140, 140), 1)
     y += H_main + gap
-
-    # B label
     cv2.putText(combined, f"B: Backup Region ({cw}x{ch}) x4",
                 (4, y + label_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
     y += label_h
     combined[y:y + pb.shape[0], :] = pb
     y += pb.shape[0] + gap
-
-    # C label
     cv2.putText(combined, f"C: CC Analysis ({num_labels - 1} CCs) | {ocr_line}",
                 (4, y + label_h - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, ocr_color, 1)
     y += label_h
     combined[y:y + pc.shape[0], :] = pc
-    y += pc.shape[0] + gap
 
-    # ── 图例 ──
     legend_items = [
         ("red rect = backup region", (0, 0, 255), 'rect'),
         ("yellow line = zero (vernier x=0)", (0, 255, 255), 'line'),
@@ -503,60 +504,47 @@ def _make_ocr_debug_vis(rotated_color: np.ndarray,
         ("green thick = selected CC", (0, 255, 100), 'rect'),
     ]
     combined = draw_legend_below(combined, legend_items)
-
-    # 顶部大标题
     cv2.putText(combined, f"STEP 3b: Main Scale OCR [{eng}]  strategy={strategy}",
                 (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-
     return combined
 
 
 def _make_zero_overview(rotated_color: np.ndarray,
-                         main_result: dict,
-                         vernier_result: dict,
-                         split_y: int,
-                         region_main: dict,
-                         region_vernier: dict) -> np.ndarray:
-    """生成零线验证概览：整张 ROI + 零线 + 主尺/游标刻度叠加 + 图例
-       下方追加：游标尺垂直投影 + 数字0验证状态"""
+                        main_result: dict,
+                        vernier_result: dict,
+                        split_y: int,
+                        region_main: dict,
+                        region_vernier: dict) -> np.ndarray:
     H, W = rotated_color.shape[:2]
     overview = rotated_color.copy()
 
-    # ── 区域分界线 ──
     cv2.line(overview, (0, split_y), (W, split_y), (255, 255, 255), 1)
     cv2.putText(overview, "MAIN", (4, split_y - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 100), 1)
     cv2.putText(overview, "VERNIER", (4, split_y + 14),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 220, 255), 1)
 
-    # ── 主尺刻度线（绿色，长刻度加粗）──
     for t in main_result.get('main_ticks', []):
         y_off = region_main.get('y_offset', 0)
-        is_long = t.get('is_long', False)
-        color = (0, 255, 80) if is_long else (0, 180, 60)
-        thickness = 4 if is_long else 3
+        color = (0, 255, 80) if t.get('is_long', False) else (0, 180, 60)
+        thickness = 4 if t.get('is_long', False) else 3
         cv2.line(overview, (t['x'], t['y_start'] + y_off),
                  (t['x'], min(t['y_end'] + y_off, split_y)), color, thickness)
 
-    # ── 游标刻度线（橙色，长刻度加粗）──
     vy_off = region_vernier.get('y_offset', split_y)
     for t in vernier_result.get('vernier_ticks', []):
-        is_long = t.get('is_long', False)
-        color = (255, 200, 50) if is_long else (200, 150, 40)
-        thickness = 3 if is_long else 2
+        color = (255, 200, 50) if t.get('is_long', False) else (200, 150, 40)
+        thickness = 3 if t.get('is_long', False) else 2
         cv2.line(overview, (t['x'], t['y_start'] + vy_off),
                  (t['x'], t['y_end'] + vy_off), color, thickness)
 
-    # ── 零线（亮蓝粗线，贯穿全图，标注 x 坐标）──
     zero_x = int(vernier_result.get('zero_x', 0))
     cv2.line(overview, (zero_x, 0), (zero_x, H - 1), (255, 60, 60), 4)
     cv2.putText(overview, f"ZERO LINE (x={zero_x})", (zero_x + 6, 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 60, 60), 2)
-    # 底部也标
     cv2.putText(overview, f"x={zero_x}", (zero_x + 6, H - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 60, 60), 2)
 
-    # ── 图例（拼到图下方）──
     legend_items = [
         ("thick red = zero line (vernier 0)", (255, 60, 60), 'line'),
         ("green line = main scale tick", (0, 180, 60), 'line'),
@@ -564,12 +552,10 @@ def _make_zero_overview(rotated_color: np.ndarray,
         ("white dash = main/vernier split", (255, 255, 255), 'line'),
     ]
 
-    # ── 零线数字0验证状态条 ──
     zero_digit_found = vernier_result.get('zero_digit_found', False)
     vproj_norm = vernier_result.get('vproj_norm')
     vernier_peaks = vernier_result.get('vernier_peaks')
 
-    # 构造验证状态横幅
     bar_h = 28
     status_bar = np.zeros((bar_h, W, 3), dtype=np.uint8)
     if zero_digit_found:
@@ -578,18 +564,19 @@ def _make_zero_overview(rotated_color: np.ndarray,
         status_color = (0, 255, 100)
     else:
         status_bar[:] = (60, 50, 30)
-        status_text = "[WARN] Zero Digit '0' NOT Found — using position fallback"
+        status_text = "[WARN] Zero Digit '0' NOT Found - using position fallback"
         status_color = (100, 180, 255)
     cv2.putText(status_bar, status_text, (8, bar_h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, status_color, 1)
 
-    # ── 游标尺垂直投影图 ──
     proj_panel = None
     if vproj_norm is not None and vernier_peaks is not None and len(vernier_peaks) > 0:
         proj_panel = draw_projection_plot(
-            vproj_norm, vernier_peaks, width=W,
-            title="Vernier Vertical Projection (for zero-line detection)")
-        # 在投影图上标注零线位置
+            vproj_norm,
+            vernier_peaks,
+            width=W,
+            title="Vernier Vertical Projection (for zero-line detection)",
+        )
         if zero_x > 0 and proj_panel is not None:
             zx_proj = int(zero_x)
             ph = proj_panel.shape[0]
@@ -599,38 +586,28 @@ def _make_zero_overview(rotated_color: np.ndarray,
                 cv2.putText(proj_panel, "ZERO", (zx_proj + 3, ph - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.35, (50, 150, 255), 1)
 
-    # ── 竖向拼接：概览图 + 状态条 + 投影图 ──
     gap = 2
-    panels = [overview]
-    # 先在图例前插入状态条
-    _panels_height = H
-    panels.append(status_bar)
-    _panels_height += gap + bar_h
+    total_h = H + gap + bar_h
     if proj_panel is not None:
-        panels.append(proj_panel)
-        _panels_height += gap + proj_panel.shape[0]
-
-    total_h = _panels_height
+        total_h += gap + proj_panel.shape[0]
     combined = np.zeros((total_h, W, 3), dtype=np.uint8)
     combined[:] = (30, 30, 35)
     y_cursor = 0
-    combined[y_cursor:y_cursor + H, :] = overview; y_cursor += H + gap
-    combined[y_cursor:y_cursor + bar_h, :] = status_bar; y_cursor += bar_h + gap
+    combined[y_cursor:y_cursor + H, :] = overview
+    y_cursor += H + gap
+    combined[y_cursor:y_cursor + bar_h, :] = status_bar
+    y_cursor += bar_h + gap
     if proj_panel is not None:
         ph = proj_panel.shape[0]
-        combined[y_cursor:y_cursor + ph, :] = proj_panel; y_cursor += ph + gap
+        combined[y_cursor:y_cursor + ph, :] = proj_panel
 
-    # ── 图例（拼到最底部）──
     combined = draw_legend_below(combined, legend_items)
-
-    cv2.putText(combined, "Step 3: Main + Zero Line (full ROI)", (5, 16),
+    cv2.putText(combined, "Step 3c: Zero Line Overview (full ROI)", (5, 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-
     return combined
 
 
 def read_caliper(image_path: str) -> CaliperResult:
-    """从文件路径读取（支持中文路径）"""
     img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"无法读取图像: {image_path}")
@@ -639,6 +616,5 @@ def read_caliper(image_path: str) -> CaliperResult:
 
 
 def read_caliper_from_array(img: np.ndarray) -> CaliperResult:
-    """从 numpy 数组读取（兼容旧接口）"""
     pipeline = CaliperPipeline()
     return pipeline.run(img)

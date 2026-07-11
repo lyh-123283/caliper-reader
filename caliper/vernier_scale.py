@@ -261,12 +261,111 @@ def _draw_vernier_ticks_on_band(region: dict,
         width=band_w,
         title=f"Narrow-band projection ({len(vernier_ticks)} ticks)"
     )
+    standard_response = _make_standard_tick_response(
+        vernier_ticks,
+        band_w,
+        x1,
+        float(band_detection.get('expected_gap', 0.0))
+    )
+    standard_peaks = np.array(
+        [int(round(t['x'] - x1)) for t in vernier_ticks
+         if 0 <= int(round(t['x'] - x1)) < band_w],
+        dtype=int
+    )
+    standard_vis = _draw_standard_response_plot(
+        standard_response,
+        standard_peaks,
+        width=band_w,
+        title="Normalized tick response (short=1.0, long=1.5)"
+    )
     gap = 2
-    out = np.zeros((disp_h + proj_vis.shape[0] + gap, band_w, 3), dtype=np.uint8)
+    out_h = disp_h + proj_vis.shape[0] + standard_vis.shape[0] + gap * 2
+    out = np.zeros((out_h, band_w, 3), dtype=np.uint8)
     out[:] = (30, 30, 35)
     out[:disp_h, :band_w] = vis
     out[disp_h + gap:disp_h + gap + proj_vis.shape[0], :band_w] = proj_vis
+    y0 = disp_h + gap + proj_vis.shape[0] + gap
+    out[y0:y0 + standard_vis.shape[0], :band_w] = standard_vis
     return out
+
+
+def _make_standard_tick_response(vernier_ticks: List[dict],
+                                 width: int,
+                                 x_offset: int,
+                                 expected_gap: float) -> np.ndarray:
+    response = np.zeros(max(0, int(width)), dtype=np.float32)
+    if width <= 0 or not vernier_ticks:
+        return response
+
+    radius = int(round(expected_gap * 0.10)) if expected_gap > 2.0 else 3
+    radius = max(2, min(6, radius))
+    sorted_ticks = sorted(vernier_ticks, key=lambda item: float(item.get('x', 0)))
+    for idx, tick in enumerate(sorted_ticks):
+        x = int(round(float(tick.get('x', 0)) - float(x_offset)))
+        if x < 0 or x >= width:
+            continue
+        height = 1.5 if tick.get('is_long', False) or idx % 5 == 0 else 1.0
+        for dx in range(-radius, radius + 1):
+            xx = x + dx
+            if 0 <= xx < width:
+                weight = 1.0 - abs(dx) / float(radius + 1)
+                response[xx] = max(response[xx], float(height * weight))
+    return response
+
+
+def _draw_standard_response_plot(signal: np.ndarray,
+                                 peaks: np.ndarray = None,
+                                 width: int = 800,
+                                 height: int = 170,
+                                 title: str = "") -> np.ndarray:
+    width = max(1, int(width))
+    plot = np.ones((height, width, 3), dtype=np.uint8) * 30
+    if signal is None or len(signal) == 0:
+        return plot
+
+    values = np.asarray(signal, dtype=float)
+    n = len(values)
+    left = 20
+    right = max(left + 1, width - 10)
+    top = 24
+    bottom = height - 24
+    chart_h = max(1, bottom - top)
+    max_y = 1.5
+
+    cv2.line(plot, (left, bottom), (right, bottom), (80, 80, 90), 1)
+    cv2.line(plot, (left, top), (left, bottom), (80, 80, 90), 1)
+    for level, color, label in [
+        (1.0, (70, 100, 70), "1.0"),
+        (1.5, (90, 90, 120), "1.5"),
+    ]:
+        y = bottom - int(round((level / max_y) * chart_h))
+        cv2.line(plot, (left, y), (right, y), color, 1, cv2.LINE_AA)
+        cv2.putText(plot, label, (2, y + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (160, 160, 170), 1)
+
+    pts = []
+    for i, value in enumerate(values):
+        x = left + int(round(i * (right - left) / max(1, n - 1)))
+        clipped = max(0.0, min(max_y, float(value)))
+        y = bottom - int(round((clipped / max_y) * chart_h))
+        pts.append((x, y))
+    for p1, p2 in zip(pts, pts[1:]):
+        cv2.line(plot, p1, p2, (90, 220, 160), 1, cv2.LINE_AA)
+
+    if peaks is not None:
+        for peak in peaks:
+            pi = int(peak)
+            if 0 <= pi < n:
+                x = left + int(round(pi * (right - left) / max(1, n - 1)))
+                clipped = max(0.0, min(max_y, float(values[pi])))
+                y = bottom - int(round((clipped / max_y) * chart_h))
+                color = (80, 255, 180) if clipped <= 1.05 else (255, 220, 90)
+                cv2.circle(plot, (x, y), 3, color, -1)
+
+    if title:
+        cv2.putText(plot, title, (10, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 220), 1)
+    return plot
 
 
 def _draw_alignment(region: dict,
@@ -851,6 +950,22 @@ def _threshold_segments_from_projection(signal: np.ndarray,
     return xs
 
 
+def _foreground_binary_from_region(binary: np.ndarray, gray: np.ndarray) -> np.ndarray:
+    if binary is None or binary.size == 0:
+        return None
+    if binary.shape[:2] != gray.shape[:2]:
+        return None
+    out = binary.copy()
+    if out.dtype != np.uint8:
+        out = out.astype(np.uint8)
+    _, out = cv2.threshold(out, 127, 255, cv2.THRESH_BINARY)
+    if float(np.mean(out > 0)) > 0.5:
+        out = cv2.bitwise_not(out)
+    if np.sum(out > 0) < gray.shape[0] * gray.shape[1] * 0.03:
+        return None
+    return out
+
+
 def _build_ticks_from_band_detection(band_detection: dict,
                                      long_tick_factor: float = None) -> List[dict]:
     """Build tick dictionaries directly from the narrow-band projection result."""
@@ -921,7 +1036,6 @@ def _build_ticks_from_band_detection(band_detection: dict,
 def _refine_vernier_tick_from_band(band: np.ndarray,
                                    approx_x: int,
                                    expected_gap: float) -> dict:
-    """Refine one vernier tick by fitting local foreground stroke centers."""
     if band is None or band.size == 0:
         return None
     h, w = band.shape[:2]
@@ -929,7 +1043,7 @@ def _refine_vernier_tick_from_band(band: np.ndarray,
         return None
 
     approx_x = int(round(approx_x))
-    radius = max(4, min(10, int(round(expected_gap * 0.35)) if expected_gap > 0 else 7))
+    radius = max(3, min(6, int(round(expected_gap * 0.20)) if expected_gap > 0 else 5))
     x1 = max(0, approx_x - radius)
     x2 = min(w - 1, approx_x + radius)
     if x2 <= x1:
@@ -940,11 +1054,12 @@ def _refine_vernier_tick_from_band(band: np.ndarray,
         return None
 
     centers = []
-    rows = []
-    weights = []
     local_approx = approx_x - x1
-    max_seg_w = max(2, int(radius * 0.9))
-    for y in range(h):
+    max_seg_w = max(3, int(round(radius * 1.2)))
+    ref_rows = max(8, min(14, int(round(expected_gap * 0.45)) if expected_gap > 0 else 10))
+    ref_y1 = min(h - 1, 2) if h > 2 else 0
+    ref_y2 = min(h, ref_y1 + ref_rows)
+    for y in range(ref_y1, ref_y2):
         xs = np.where(crop[y])[0]
         if len(xs) == 0:
             continue
@@ -964,44 +1079,29 @@ def _refine_vernier_tick_from_band(band: np.ndarray,
             continue
 
         center = x1 + (seg[0] + seg[1]) / 2.0
-        if abs(center - approx_x) > radius * 0.85:
+        if abs(center - approx_x) > radius * 0.90:
             continue
         centers.append(center)
-        rows.append(float(y))
-        weights.append(float(seg_w))
 
-    min_points = max(5, int(h * 0.14))
-    if len(centers) < min_points:
-        return None
-
-    ys = np.array(rows, dtype=float)
-    xs = np.array(centers, dtype=float)
-    ws = np.array(weights, dtype=float)
-    y_start = int(round(float(np.min(ys))))
-    y_end = int(round(float(np.max(ys))))
-    if y_end <= y_start:
-        return None
-
-    if len(xs) >= 3 and float(np.ptp(ys)) >= 2.0:
-        slope, intercept = np.polyfit(ys, xs, 1, w=ws)
+    x_ref = float(np.median(centers)) if centers else float(approx_x)
+    row_on = np.mean(crop, axis=1) > 0.12
+    ys = np.where(row_on)[0]
+    if len(ys) > 0:
+        y_start = int(ys[0])
+        y_end = int(ys[-1])
     else:
-        slope = 0.0
-        intercept = float(np.average(xs, weights=ws))
-
-    length = y_end - y_start
-    y_ref = y_start + min(max(2, int(round(length * 0.25))), 10)
-    y_ref = max(y_start, min(y_end, y_ref))
-    x_ref = float(slope * y_ref + intercept)
-    x_top = float(slope * y_start + intercept)
-    x_bottom = float(slope * y_end + intercept)
+        y_start = 0
+        y_end = h - 1
+    if y_end <= y_start:
+        y_end = min(h - 1, y_start + 1)
 
     return {
         'x': max(0.0, min(float(w - 1), x_ref)),
-        'x_top': max(0.0, min(float(w - 1), x_top)),
-        'x_bottom': max(0.0, min(float(w - 1), x_bottom)),
+        'x_top': max(0.0, min(float(w - 1), x_ref)),
+        'x_bottom': max(0.0, min(float(w - 1), x_ref)),
         'y_start': y_start,
         'y_end': y_end,
-        'slope': float(slope),
+        'slope': 0.0,
     }
 
 
@@ -1337,13 +1437,15 @@ def recognize_vernier_scale(region: dict,
     if main_gap <= 0:
         main_gap = 10.0
 
-    binary = cv2.adaptiveThreshold(
-        img, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=config.vernier_scale.adaptive_block_size,
-        C=config.vernier_scale.adaptive_C
-    )
+    binary = _foreground_binary_from_region(region.get('binary'), img)
+    if binary is None:
+        binary = cv2.adaptiveThreshold(
+            img, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=config.vernier_scale.adaptive_block_size,
+            C=config.vernier_scale.adaptive_C
+        )
     if np.sum(binary > 0) < img.shape[0] * img.shape[1] * 0.03:
         _, binary = cv2.threshold(img, 0, 255,
                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)

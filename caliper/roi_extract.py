@@ -8,11 +8,388 @@
 import cv2
 import numpy as np
 import time
+from pathlib import Path
 from typing import Tuple, List
 
 from .utils import rotate_image
 from .config import config
 from .vernier_rectify import _find_vernier_body_x_range
+
+_ROI_SCREW_TEMPLATE_CACHE = None
+
+
+def _read_image_unicode(path: Path, flags=cv2.IMREAD_COLOR):
+    if not path.exists():
+        return None
+    data = np.fromfile(str(path), dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
+def _load_roi_screw_template():
+    global _ROI_SCREW_TEMPLATE_CACHE
+    if _ROI_SCREW_TEMPLATE_CACHE is not None:
+        return _ROI_SCREW_TEMPLATE_CACHE
+    path = Path(__file__).resolve().parent.parent / 'templates' / 'roi_screw_template.png'
+    img = _read_image_unicode(path, cv2.IMREAD_GRAYSCALE)
+    if img is None or img.size == 0:
+        _ROI_SCREW_TEMPLATE_CACHE = False
+        return None
+    _ROI_SCREW_TEMPLATE_CACHE = img
+    return img
+
+
+def _locate_roi_by_screw_template(img_color: np.ndarray) -> dict:
+    template_gray = _load_roi_screw_template()
+    if template_gray is None or template_gray is False:
+        return None
+    if img_color is None or img_color.size == 0:
+        return None
+
+    timings = {}
+
+    def mark(key: str, start_time: float):
+        timings[key] = (time.perf_counter() - start_time) * 1000.0
+
+    h, w = img_color.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
+    scale = min(1.0, 600.0 / float(w))
+    t0 = time.perf_counter()
+    if scale < 1.0:
+        small_color = cv2.resize(
+            img_color, (int(round(w * scale)), int(round(h * scale))),
+            interpolation=cv2.INTER_LINEAR)
+    else:
+        small_color = img_color
+    small_gray = cv2.cvtColor(small_color, cv2.COLOR_BGR2GRAY)
+    tw = max(8, int(round(template_gray.shape[1] * scale)))
+    th = max(8, int(round(template_gray.shape[0] * scale)))
+    small_template = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
+    mark('template_resize_gray', t0)
+
+    t0 = time.perf_counter()
+    search_gray, search_offset = _screw_template_search_window(small_gray)
+    candidates = _screw_template_candidates(
+        search_gray, small_template,
+        scales=(1.0,),
+        per_scale_k=12)
+    if search_offset != (0, 0):
+        ox, oy = search_offset
+        for candidate in candidates:
+            x, y = candidate['loc']
+            candidate['loc'] = (x + ox, y + oy)
+    mark('template_match', t0)
+    if not candidates:
+        return None
+
+    t0 = time.perf_counter()
+    pool = _nms_template_candidates(candidates, top_k=20, iou_thresh=0.25)
+    geometry = _find_two_screw_rows(
+        pool,
+        y_tolerance=55.0 * scale,
+        min_spacing=180.0 * scale,
+        spacing_tolerance=0.45,
+        row_gap_min=180.0 * scale,
+        row_gap_max=850.0 * scale,
+        x_align_ratio=0.45)
+    mark('template_geometry', t0)
+    if not _screw_geometry_is_valid(geometry):
+        t0 = time.perf_counter()
+        candidates = _screw_template_candidates(
+            search_gray, small_template,
+            scales=(0.8, 0.9, 1.0, 1.1, 1.2),
+            per_scale_k=20)
+        if search_offset != (0, 0):
+            ox, oy = search_offset
+            for candidate in candidates:
+                x, y = candidate['loc']
+                candidate['loc'] = (x + ox, y + oy)
+        timings['template_match_fallback'] = (time.perf_counter() - t0) * 1000.0
+
+        t0 = time.perf_counter()
+        pool = _nms_template_candidates(candidates, top_k=50, iou_thresh=0.25)
+        geometry = _find_two_screw_rows(
+            pool,
+            y_tolerance=55.0 * scale,
+            min_spacing=180.0 * scale,
+            spacing_tolerance=0.45,
+            row_gap_min=180.0 * scale,
+            row_gap_max=850.0 * scale,
+            x_align_ratio=0.45)
+        timings['template_geometry_fallback'] = (time.perf_counter() - t0) * 1000.0
+        if not _screw_geometry_is_valid(geometry):
+            return None
+
+    t0 = time.perf_counter()
+    polygon = _screw_roi_polygon(
+        geometry,
+        left_pad_ratio=1.10,
+        right_pad_ratio=0.65,
+        top_down_ratio=-0.08,
+        bottom_pad_ratio=0.22)
+    if polygon is None:
+        return None
+
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    inv_scale = 1.0 / scale if scale > 0 else 1.0
+    ox1 = max(0, int(np.floor(min(xs) * inv_scale)))
+    oy1 = max(0, int(np.floor(min(ys) * inv_scale)))
+    ox2 = min(w, int(np.ceil(max(xs) * inv_scale)))
+    oy2 = min(h, int(np.ceil(max(ys) * inv_scale)))
+    if ox2 - ox1 < config.roi.min_roi_width or oy2 - oy1 < config.roi.min_roi_height:
+        return None
+    crop = img_color[oy1:oy2, ox1:ox2].copy()
+    mark('template_map_and_crop', t0)
+    t0 = time.perf_counter()
+    roi_debug = _make_roi_location_vis(
+        small_color,
+        (min(xs), min(ys), max(xs), max(ys)),
+        crop,
+        'screw_template'
+    )
+    mark('roi_debug_vis', t0)
+
+    return {
+        'roi_color': crop,
+        'x_offset': ox1,
+        'y_offset': oy1,
+        'roi_box_original': (ox1, oy1, ox2, oy2),
+        'roi_box_lowres': (min(xs), min(ys), max(xs), max(ys)),
+        'roi_polygon_lowres': tuple(polygon),
+        'scale': scale,
+        'lowres_debug': roi_debug,
+        'roi_timings': timings,
+        'locate_failed': False,
+        'roi_source': 'screw_template',
+    }
+
+
+def _screw_template_search_window(gray: np.ndarray) -> tuple:
+    h, w = gray.shape[:2]
+    if h <= 0 or w <= 0:
+        return gray, (0, 0)
+    x1 = int(round(w * 0.25))
+    x2 = int(round(w * 0.75))
+    y1 = int(round(h * 0.25))
+    y2 = int(round(h * 0.75))
+    if x2 <= x1 or y2 <= y1:
+        return gray, (0, 0)
+    return gray[y1:y2, x1:x2], (x1, y1)
+
+
+def _screw_geometry_is_valid(geometry: dict) -> bool:
+    if geometry is None:
+        return False
+    items = geometry['top']['items'] + geometry['bottom']['items']
+    scores = [float(candidate.get('score', 0.0)) for candidate in items]
+    return len(scores) >= 6 and min(scores) >= 0.42
+
+
+def _screw_template_candidates(target_gray: np.ndarray,
+                               template_gray: np.ndarray,
+                               scales: tuple,
+                               per_scale_k: int) -> list:
+    candidates = []
+    th0, tw0 = template_gray.shape[:2]
+    for scale in scales:
+        tw = max(8, int(round(tw0 * scale)))
+        th = max(8, int(round(th0 * scale)))
+        if tw >= target_gray.shape[1] or th >= target_gray.shape[0]:
+            continue
+        resized = cv2.resize(template_gray, (tw, th), interpolation=cv2.INTER_AREA)
+        result = cv2.matchTemplate(target_gray, resized, cv2.TM_CCOEFF_NORMED)
+        work = result.copy()
+        suppress_x = max(1, tw // 2)
+        suppress_y = max(1, th // 2)
+        for _ in range(max(1, per_scale_k)):
+            _, max_val, _, max_loc = cv2.minMaxLoc(work)
+            candidates.append({
+                'score': float(max_val),
+                'loc': max_loc,
+                'size': (tw, th),
+                'scale': float(scale),
+            })
+            x, y = max_loc
+            x1 = max(0, x - suppress_x)
+            y1 = max(0, y - suppress_y)
+            x2 = min(work.shape[1], x + suppress_x + 1)
+            y2 = min(work.shape[0], y + suppress_y + 1)
+            work[y1:y2, x1:x2] = -1.0
+    return sorted(candidates, key=lambda item: item['score'], reverse=True)
+
+
+def _template_box(candidate: dict) -> tuple:
+    x, y = candidate['loc']
+    tw, th = candidate['size']
+    return int(x), int(y), int(x + tw), int(y + th)
+
+
+def _template_iou(a: tuple, b: tuple) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def _nms_template_candidates(candidates: list, top_k: int, iou_thresh: float) -> list:
+    selected = []
+    for candidate in candidates:
+        box = _template_box(candidate)
+        if any(_template_iou(box, _template_box(prev)) > iou_thresh for prev in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= top_k:
+            break
+    return selected
+
+
+def _template_center(candidate: dict) -> tuple:
+    x1, y1, x2, y2 = _template_box(candidate)
+    return (x1 + x2) * 0.5, (y1 + y2) * 0.5
+
+
+def _find_screw_row_triples(candidates: list,
+                            y_tolerance: float,
+                            min_spacing: float,
+                            spacing_tolerance: float) -> list:
+    rows = []
+    n = len(candidates)
+    for i in range(n):
+        for j in range(i + 1, n):
+            for k in range(j + 1, n):
+                triple = [candidates[i], candidates[j], candidates[k]]
+                centers = [_template_center(c) for c in triple]
+                ordered = sorted(zip(centers, triple), key=lambda item: item[0][0])
+                xs = [item[0][0] for item in ordered]
+                ys = [item[0][1] for item in ordered]
+                y_spread = max(ys) - min(ys)
+                if y_spread > y_tolerance:
+                    continue
+                dx1 = xs[1] - xs[0]
+                dx2 = xs[2] - xs[1]
+                if dx1 < min_spacing or dx2 < min_spacing:
+                    continue
+                spacing_ratio = abs(dx1 - dx2) / max(dx1, dx2, 1.0)
+                if spacing_ratio > spacing_tolerance:
+                    continue
+                score = sum(1.0 - item[1]['score'] for item in ordered)
+                score += (y_spread / max(y_tolerance, 1.0)) * 0.05
+                score += spacing_ratio * 0.10
+                rows.append({
+                    'items': [item[1] for item in ordered],
+                    'xs': xs,
+                    'ys': ys,
+                    'y': float(np.median(ys)),
+                    'spacing': (dx1 + dx2) * 0.5,
+                    'score': score,
+                    'spacing_ratio': spacing_ratio,
+                })
+    return sorted(rows, key=lambda item: item['score'])
+
+
+def _find_two_screw_rows(candidates: list,
+                         y_tolerance: float,
+                         min_spacing: float,
+                         spacing_tolerance: float,
+                         row_gap_min: float,
+                         row_gap_max: float,
+                         x_align_ratio: float):
+    rows = _find_screw_row_triples(candidates, y_tolerance, min_spacing, spacing_tolerance)
+    best = None
+    row_limit = min(len(rows), 300)
+    for a_idx in range(row_limit):
+        for b_idx in range(a_idx + 1, row_limit):
+            row_a = rows[a_idx]
+            row_b = rows[b_idx]
+            top, bottom = (row_a, row_b) if row_a['y'] <= row_b['y'] else (row_b, row_a)
+            row_gap = bottom['y'] - top['y']
+            if row_gap < row_gap_min or row_gap > row_gap_max:
+                continue
+            avg_spacing = max(1.0, (top['spacing'] + bottom['spacing']) * 0.5)
+            x_align = float(np.median([abs(tx - bx) for tx, bx in zip(top['xs'], bottom['xs'])]))
+            if x_align > avg_spacing * x_align_ratio:
+                continue
+            spacing_diff = abs(top['spacing'] - bottom['spacing']) / avg_spacing
+            if spacing_diff > spacing_tolerance:
+                continue
+            pair_score = top['score'] + bottom['score']
+            pair_score += (x_align / max(avg_spacing * x_align_ratio, 1.0)) * 0.20
+            pair_score += spacing_diff * 0.15
+            pair_score += (row_gap / max(row_gap_max, 1.0)) * 0.02
+            if best is None or pair_score < best['score']:
+                best = {
+                    'top': top,
+                    'bottom': bottom,
+                    'score': pair_score,
+                    'row_gap': row_gap,
+                    'x_align': x_align,
+                    'spacing_diff': spacing_diff,
+                }
+    return best
+
+
+def _screw_roi_polygon(geometry: dict,
+                       left_pad_ratio: float,
+                       right_pad_ratio: float,
+                       top_down_ratio: float,
+                       bottom_pad_ratio: float):
+    top_centers = [np.array(_template_center(c), dtype=np.float32) for c in geometry['top']['items']]
+    bottom_centers = [np.array(_template_center(c), dtype=np.float32) for c in geometry['bottom']['items']]
+    all_centers = top_centers + bottom_centers
+    row_vec = ((top_centers[-1] - top_centers[0]) +
+               (bottom_centers[-1] - bottom_centers[0])) * 0.5
+    row_norm = float(np.linalg.norm(row_vec))
+    if row_norm < 1e-6:
+        return None
+    x_axis = row_vec / row_norm
+    y_axis = np.array([-x_axis[1], x_axis[0]], dtype=np.float32)
+    row_down = np.mean(bottom_centers, axis=0) - np.mean(top_centers, axis=0)
+    if float(np.dot(y_axis, row_down)) < 0:
+        y_axis = -y_axis
+
+    us = [float(np.dot(p, x_axis)) for p in all_centers]
+    top_vs = [float(np.dot(p, y_axis)) for p in top_centers]
+    bottom_vs = [float(np.dot(p, y_axis)) for p in bottom_centers]
+    left_u = min(us)
+    right_u = max(us)
+    top_v = float(np.median(top_vs))
+    bottom_v = float(np.median(bottom_vs))
+    spacing = max(1.0, (geometry['top']['spacing'] + geometry['bottom']['spacing']) * 0.5)
+    row_gap = max(1.0, bottom_v - top_v)
+
+    widths = []
+    heights = []
+    for candidate in geometry['top']['items'] + geometry['bottom']['items']:
+        x1, y1, x2, y2 = _template_box(candidate)
+        widths.append(x2 - x1)
+        heights.append(y2 - y1)
+    half_w = float(np.median(widths)) * 0.5
+    half_h = float(np.median(heights)) * 0.5
+
+    u_min = left_u - spacing * left_pad_ratio - half_w
+    u_max = right_u + spacing * right_pad_ratio + half_w
+    v_min = top_v + row_gap * top_down_ratio - half_h
+    v_max = bottom_v + row_gap * bottom_pad_ratio + half_h
+
+    corners = []
+    for u, v in [(u_min, v_min), (u_max, v_min), (u_max, v_max), (u_min, v_max)]:
+        p = x_axis * u + y_axis * v
+        corners.append((int(round(float(p[0]))), int(round(float(p[1])))))
+    return corners
 
 
 # ═══════════════════════════════════════════════════════════
@@ -21,6 +398,10 @@ from .vernier_rectify import _find_vernier_body_x_range
 
 def locate_roi_lowres(img_color: np.ndarray,
                       max_width: int = 1600) -> dict:
+    template_result = _locate_roi_by_screw_template(img_color)
+    if template_result is not None:
+        return template_result
+
     timings = {}
 
     def mark(key: str, start_time: float):
@@ -99,6 +480,11 @@ def locate_roi_lowres(img_color: np.ndarray,
 
     crop = img_color[oy1:oy2, ox1:ox2].copy()
     mark('map_and_crop', t0)
+    t0 = time.perf_counter()
+    roi_debug = _make_roi_location_vis(
+        img_color, (ox1, oy1, ox2, oy2), crop, 'lowres_projection'
+    )
+    mark('roi_debug_vis', t0)
     return {
         'roi_color': crop,
         'x_offset': ox1,
@@ -106,10 +492,68 @@ def locate_roi_lowres(img_color: np.ndarray,
         'roi_box_original': (ox1, oy1, ox2, oy2),
         'roi_box_lowres': (x1, y1, x2, y2),
         'scale': scale,
-        'lowres_debug': None,
+        'lowres_debug': roi_debug,
         'roi_timings': timings,
         'locate_failed': False,
+        'roi_source': 'lowres_projection',
     }
+
+
+def _make_roi_location_vis(img_color: np.ndarray,
+                           roi_box: tuple,
+                           roi_crop: np.ndarray,
+                           source: str) -> np.ndarray:
+    if img_color is None or roi_box is None:
+        return None
+    h, w = img_color.shape[:2]
+    if h <= 0 or w <= 0:
+        return None
+
+    top_w = 640
+    scale = min(1.0, top_w / float(w))
+    view_w = max(1, int(round(w * scale)))
+    view_h = max(1, int(round(h * scale)))
+    if abs(scale - 1.0) < 1e-6:
+        overview = img_color.copy()
+    else:
+        overview = cv2.resize(img_color, (view_w, view_h), interpolation=cv2.INTER_AREA)
+
+    x1, y1, x2, y2 = roi_box
+    p1 = (int(round(x1 * scale)), int(round(y1 * scale)))
+    p2 = (int(round(x2 * scale)), int(round(y2 * scale)))
+    cv2.rectangle(overview, p1, p2, (0, 255, 120), 3, cv2.LINE_AA)
+    cv2.putText(
+        overview, f"ROI: {source}", (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA
+    )
+    cv2.putText(
+        overview, f"ROI: {source}", (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA
+    )
+
+    if roi_crop is None or roi_crop.size == 0:
+        return overview
+    ch, cw = roi_crop.shape[:2]
+    crop_w = view_w
+    crop_h = max(1, int(round(ch * (crop_w / float(max(cw, 1))))))
+    crop_h = min(crop_h, 160)
+    crop_w = max(1, int(round(cw * (crop_h / float(max(ch, 1))))))
+    crop_view = cv2.resize(roi_crop, (crop_w, crop_h), interpolation=cv2.INTER_NEAREST)
+
+    gap = 8
+    out_w = max(view_w, crop_w)
+    out_h = view_h + gap + crop_h
+    out = np.zeros((out_h, out_w, 3), dtype=np.uint8)
+    out[:] = (28, 28, 32)
+    out[:view_h, :view_w] = overview
+    crop_x = (out_w - crop_w) // 2
+    out[view_h + gap:view_h + gap + crop_h, crop_x:crop_x + crop_w] = crop_view
+    cv2.rectangle(
+        out, (crop_x, view_h + gap),
+        (crop_x + crop_w - 1, view_h + gap + crop_h - 1),
+        (0, 255, 120), 2, cv2.LINE_AA
+    )
+    return out
 
 
 def _make_lowres_roi_enhanced(gray: np.ndarray) -> np.ndarray:

@@ -19,7 +19,8 @@ def merge_readings(main_result: dict,
                     region_main: dict,
                     region_vernier: dict,
                     split_y: int,
-                    make_debug: bool = True) -> CaliperResult:
+                    make_debug: bool = True,
+                    simple_annotation: bool = False) -> CaliperResult:
     """
     合并主尺和游标尺读数，生成最终结果
 
@@ -79,13 +80,20 @@ def merge_readings(main_result: dict,
 
     # ── 最终标注图（含读数推导可视化）──
     t0 = time.perf_counter()
-    annotated = draw_final_annotation(
-        rotated_color, region_main, region_vernier,
-        main_ticks, vernier_ticks, main_gap, split_y,
-        main_reading, vernier_reading, total, precision,
-        zero_x, aligned_tick, main_digits, vernier_digits,
-        main_derivation, vernier_aligned_idx
-    )
+    if simple_annotation:
+        annotated = draw_simple_final_annotation(
+            rotated_color, region_vernier, split_y,
+            main_reading, vernier_reading, total, precision,
+            zero_x, aligned_tick, vernier_aligned_idx
+        )
+    else:
+        annotated = draw_final_annotation(
+            rotated_color, region_main, region_vernier,
+            main_ticks, vernier_ticks, main_gap, split_y,
+            main_reading, vernier_reading, total, precision,
+            zero_x, aligned_tick, main_digits, vernier_digits,
+            main_derivation, vernier_aligned_idx
+        )
     mark('final_annotation', '最终标注图', t0)
 
     # ── 读数推导专用可视化（单独一张调试图像）──
@@ -589,6 +597,53 @@ def draw_final_annotation(rotated_color: np.ndarray,
 
 
 # ═══════════════════════════ 可视化辅助函数 ═══════════════════════════
+
+def draw_simple_final_annotation(rotated_color: np.ndarray,
+                                 region_vernier: dict,
+                                 split_y: int,
+                                 main_reading: float,
+                                 vernier_reading: float,
+                                 total: float,
+                                 precision: float,
+                                 zero_x: float,
+                                 aligned_tick: dict = None,
+                                 vernier_aligned_idx: int = -1) -> np.ndarray:
+    ann = rotated_color.copy()
+    H, W = ann.shape[:2]
+    zx = int(round(zero_x))
+    vy_off = region_vernier.get('y_offset', split_y)
+
+    header_h = max(76, min(96, H // 7))
+    cv2.rectangle(ann, (0, 0), (W, header_h), (18, 18, 24), -1)
+
+    cv2.line(ann, (0, split_y), (W, split_y), (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.line(ann, (zx, 0), (zx, H - 1), (40, 40, 255), 2, cv2.LINE_AA)
+    cv2.putText(ann, "0", (min(W - 18, zx + 5), max(18, split_y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (40, 40, 255), 2, cv2.LINE_AA)
+
+    if aligned_tick and vernier_aligned_idx >= 0:
+        ax = int(round(aligned_tick['x']))
+        y1 = int(round(aligned_tick.get('y_start', 0) + vy_off))
+        y2 = int(round(aligned_tick.get('y_end', 0) + vy_off))
+        y1 = max(0, min(H - 1, y1))
+        y2 = max(0, min(H - 1, y2))
+        cy = int(round(aligned_tick.get('y_mid', (y1 + y2) / 2) + vy_off))
+        cy = max(0, min(H - 1, cy))
+        cv2.line(ann, (ax, y1), (ax, y2), (0, 230, 90), 4, cv2.LINE_AA)
+        cv2.circle(ann, (ax, cy), max(10, min(20, H // 26)), (0, 230, 90), 2, cv2.LINE_AA)
+        cv2.putText(ann, f"i={vernier_aligned_idx}", (min(W - 70, ax + 8), max(18, cy - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 230, 90), 2, cv2.LINE_AA)
+
+    total_text = f"{total:.2f} mm"
+    detail_text = f"Main {main_reading:.1f}  +  Vernier {vernier_reading:.2f}  ({precision:.2f} mm)"
+    cv2.putText(ann, total_text, (14, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 4, cv2.LINE_AA)
+    cv2.putText(ann, total_text, (14, 34),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (80, 255, 130), 2, cv2.LINE_AA)
+    cv2.putText(ann, detail_text, (18, 64),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48, (230, 235, 235), 1, cv2.LINE_AA)
+    return ann
+
 
 def _draw_label_box(img, cx, cy, text, bg_color, fg_color, pad, font_scale=0.55):
     """在 (cx,cy) 处画一个半透明圆角标签框 + 白描边文字"""

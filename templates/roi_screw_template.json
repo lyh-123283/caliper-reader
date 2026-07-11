@@ -1,0 +1,10 @@
+{
+  "source": "youbiaokachi.jpg",
+  "bbox": [
+    1635,
+    1184,
+    1744,
+    1287
+  ],
+  "label": "screw"
+}

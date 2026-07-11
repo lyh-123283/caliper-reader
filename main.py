@@ -392,9 +392,7 @@ class CaliperApp:
             self.tab_widgets.clear()
             self.tab_keys.clear()
 
-        all_keys = ['原图'] if self.current_image is not None else []
-        all_keys.extend(sorted(debug_images.keys()))
-        all_keys.append('最终标注')
+        all_keys = self._ordered_tab_keys(debug_images)
 
         tab_style = {
             'font': ('Microsoft YaHei', 8),
@@ -407,8 +405,7 @@ class CaliperApp:
         for key in all_keys:
             if key in self.tab_widgets:
                 continue
-            # 缩短显示名
-            display = key.replace('_', ' ').replace('a', '').replace('b', '').replace('c', '')
+            display = self._tab_display_name(key)
             if len(display) > 10:
                 display = display[:9] + '…'
 
@@ -420,6 +417,55 @@ class CaliperApp:
 
         if reset and self.tab_keys:
             self._switch_tab(self.tab_keys[0])
+
+    def _ordered_tab_keys(self, debug_images: dict) -> list:
+        keys = []
+        if self.current_image is not None:
+            keys.append('原图')
+        preferred = [
+            '1_ROI定位',
+            '1a_ROI定位',
+            '0_预处理',
+            '1b_方向校正',
+            '2_区域分离',
+            '3a_主尺刻度线',
+            '3c_零线总览',
+            '4b_游标刻度线',
+            '4c_游标对齐',
+            '3b_主尺数字OCR',
+            '5_最终标注',
+            '5b_读数推导',
+        ]
+        for key in preferred:
+            if key in debug_images and key not in keys:
+                keys.append(key)
+        for key in sorted(debug_images.keys()):
+            if key not in keys:
+                keys.append(key)
+        if '5_最终标注' not in debug_images and self.current_result is not None:
+            keys.append('最终标注')
+        return keys
+
+    def _tab_display_name(self, key: str) -> str:
+        names = {
+            '原图': '原图',
+            '1_ROI定位': 'ROI定位',
+            '1a_ROI定位': 'ROI定位',
+            '0_预处理': '预处理',
+            '1b_方向校正': '方向校正',
+            '2_区域分离': '区域分离',
+            '3a_主尺刻度线': '主尺刻线',
+            '3c_零线总览': '零线总览',
+            '4b_游标刻度线': '游标刻线',
+            '4c_游标对齐': '游标对齐',
+            '3b_主尺数字OCR': '主尺OCR',
+            '5_最终标注': '最终标注',
+            '5b_读数推导': '读数推导',
+            '最终标注': '最终标注',
+        }
+        if key in names:
+            return names[key]
+        return key.split('_', 1)[1] if '_' in key else key
 
     def _make_pending_result(self) -> CaliperResult:
         """Create a temporary result object while the pipeline is still running."""

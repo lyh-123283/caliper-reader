@@ -41,13 +41,15 @@ def recognize_main_scale(region: dict,
     h, w = img.shape
 
     # ── 1. 自适应二值化（比 OTSU 更鲁棒，避免低对比度时全部消失）──
-    binary = cv2.adaptiveThreshold(
-        img, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV,
-        blockSize=config.main_scale.adaptive_block_size,
-        C=config.main_scale.adaptive_C
-    )
+    binary = _foreground_binary_from_region(region.get('binary'), img)
+    if binary is None:
+        binary = cv2.adaptiveThreshold(
+            img, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            blockSize=config.main_scale.adaptive_block_size,
+            C=config.main_scale.adaptive_C
+        )
     # 回退：自适应阈值得到的前景太少（全部淹没），改用 OTSU
     if np.sum(binary > 0) < w * h * 0.03:
         _, binary = cv2.threshold(img, 0, 255,
@@ -63,21 +65,25 @@ def recognize_main_scale(region: dict,
     else:
         vproj_norm = vproj
 
-    main_xs = _find_threshold_segments(
+    coarse_main_xs = _find_threshold_segments(
         vproj_norm,
         threshold_factor=config.main_scale.peak_threshold_factor,
     )
-    if len(main_xs) < config.main_scale.min_tick_count:
+    if len(coarse_main_xs) < config.main_scale.min_tick_count:
         return _empty_main_result()
 
     # ── 2.5 等间距补全 & 校验 ──
     # ── 3. 精密提取刻线 ──
     tick_band_binary = binary[band_y1:band_y2, :]
     main_ticks = extract_ticks_from_binary(
-        tick_band_binary, main_xs,
+        tick_band_binary, coarse_main_xs,
         long_tick_factor=config.main_scale.long_tick_factor)
     if len(main_ticks) < config.main_scale.min_tick_count:
         return _empty_main_result()
+    main_ticks = _refine_main_ticks_near_split(
+        tick_band_binary, main_ticks,
+        expected_gap=_estimate_gap_from_xs(coarse_main_xs)
+    )
     for tick in main_ticks:
         tick['y_start'] += band_y1
         tick['y_end'] += band_y1
@@ -96,7 +102,10 @@ def recognize_main_scale(region: dict,
     main_reading = 0.0
 
     # ── 可视化 ──
-    vis_ticks = _draw_main_ticks(region, binary, main_ticks, vproj_norm, main_xs) if make_debug else None
+    vis_ticks = _draw_main_ticks(
+        region, binary, main_ticks, vproj_norm,
+        coarse_main_xs, main_xs
+    ) if make_debug else None
 
     return {
         'main_ticks': main_ticks,
@@ -121,7 +130,7 @@ def find_nearest_cm_digit_region(main_ticks: List[dict],
     y_starts = [t['y_start'] for t in main_ticks if 'y_start' in t]
     if len(y_starts) < 3:
         return None, 0, 0
-    y_top_tick = max(y_starts)
+    y_top_tick = int(round(float(np.percentile(y_starts, 85))))
 
     y_top = max(0, y_top_tick - int(4 * main_gap))
     y_bottom = max(y_top + 8, y_top_tick - int(1 * main_gap))
@@ -156,6 +165,126 @@ def _find_threshold_segments(signal: np.ndarray,
     if start is not None:
         xs.append((start + len(mask) - 1) // 2)
     return np.array(xs, dtype=int)
+
+
+def _estimate_gap_from_xs(xs: np.ndarray) -> float:
+    if xs is None or len(xs) < 2:
+        return 0.0
+    diffs = np.diff(np.sort(np.asarray(xs, dtype=float)))
+    diffs = diffs[diffs > 1.0]
+    return float(np.median(diffs)) if len(diffs) else 0.0
+
+
+def _refine_main_ticks_near_split(binary: np.ndarray,
+                                  ticks: List[dict],
+                                  expected_gap: float) -> List[dict]:
+    if binary is None or binary.size == 0 or not ticks:
+        return ticks
+    h, w = binary.shape[:2]
+    if h <= 0 or w <= 0:
+        return ticks
+
+    radius = max(3, min(6, int(round(expected_gap * 0.20)) if expected_gap > 0 else 5))
+    ref_rows = max(8, min(14, int(round(expected_gap * 0.45)) if expected_gap > 0 else 10))
+    ref_y2 = max(1, h - 2) if h > 2 else h
+    ref_y1 = max(0, ref_y2 - ref_rows)
+    ref_band = binary[ref_y1:ref_y2, :] > 0
+    refined_ticks = []
+    for tick in ticks:
+        approx_x = int(round(tick.get('x', 0)))
+        if approx_x < 0 or approx_x >= w:
+            refined_ticks.append(tick)
+            continue
+        x1 = max(0, approx_x - radius)
+        x2 = min(w - 1, approx_x + radius)
+        if x2 <= x1:
+            refined_ticks.append(tick)
+            continue
+
+        col_scores = np.sum(ref_band[:, x1:x2 + 1], axis=0).astype(float)
+        centers = None
+        local_approx = approx_x - x1
+        if col_scores.size and float(np.max(col_scores)) > 0:
+            threshold = max(1.0, float(np.max(col_scores)) * 0.35)
+            xs = np.where(col_scores >= threshold)[0]
+            if len(xs) > 0:
+                segs = _contiguous_int_segments(xs)
+                if segs:
+                    seg = min(
+                        segs,
+                        key=lambda s: (
+                            abs(((s[0] + s[1]) / 2.0) - local_approx),
+                            -(s[1] - s[0] + 1),
+                        )
+                    )
+                    local = col_scores[seg[0]:seg[1] + 1]
+                    local_xs = np.arange(seg[0], seg[1] + 1, dtype=float)
+                    total = float(np.sum(local))
+                    if total > 1e-6:
+                        centers = x1 + float(np.sum(local_xs * local) / total)
+                    else:
+                        centers = x1 + (seg[0] + seg[1]) / 2.0
+
+        refined = dict(tick)
+        refined['x_projection'] = approx_x
+        if centers is not None and abs(float(centers) - approx_x) <= radius * 0.90:
+            refined['x'] = int(round(float(centers)))
+        refined['source'] = 'main_split_near_refined'
+        refined_ticks.append(refined)
+    return sorted(refined_ticks, key=lambda t: t['x'])
+
+
+def _contiguous_int_segments(xs: np.ndarray) -> List[tuple]:
+    if xs is None or len(xs) == 0:
+        return []
+    xs = np.array(xs, dtype=int)
+    segments = []
+    start = int(xs[0])
+    prev = int(xs[0])
+    for value in xs[1:]:
+        value = int(value)
+        if value == prev + 1:
+            prev = value
+            continue
+        segments.append((start, prev))
+        start = value
+        prev = value
+    segments.append((start, prev))
+    return segments
+
+
+def _foreground_binary_from_region(binary: np.ndarray, gray: np.ndarray) -> np.ndarray:
+    if binary is None or binary.size == 0:
+        return None
+    if binary.shape[:2] != gray.shape[:2]:
+        return None
+    out = binary.copy()
+    if out.dtype != np.uint8:
+        out = out.astype(np.uint8)
+    _, out = cv2.threshold(out, 127, 255, cv2.THRESH_BINARY)
+    if float(np.mean(out > 0)) > 0.5:
+        out = cv2.bitwise_not(out)
+    if np.sum(out > 0) < gray.shape[0] * gray.shape[1] * 0.03:
+        return None
+    return out
+
+
+def _main_split_near_projection(binary: np.ndarray,
+                                band_y1: int,
+                                band_y2: int) -> np.ndarray:
+    h, w = binary.shape[:2]
+    if h <= 0 or w <= 0:
+        return np.asarray([], dtype=float)
+    band_y1 = max(0, min(h - 1, int(band_y1)))
+    band_y2 = max(band_y1 + 1, min(h, int(band_y2)))
+    band_h = band_y2 - band_y1
+    ref_rows = max(8, min(14, int(round(band_h * 0.12))))
+    ref_y2 = max(band_y1 + 1, band_y2 - 2) if band_h > 2 else band_y2
+    ref_y1 = max(band_y1, ref_y2 - ref_rows)
+    proj = np.sum(binary[ref_y1:ref_y2, :] > 0, axis=0).astype(float)
+    if np.max(proj) > 0:
+        return proj / np.max(proj)
+    return proj
 
 
 def find_digit_cc_candidates(binary_crop: np.ndarray,
@@ -233,7 +362,8 @@ def _draw_main_ticks(region: dict,
                       binary: np.ndarray,
                       main_ticks: List[dict],
                       vproj: np.ndarray,
-                      peaks: np.ndarray) -> np.ndarray:
+                      coarse_peaks: np.ndarray,
+                      refined_peaks: np.ndarray) -> np.ndarray:
     """绘制主尺刻度线检测结果 — 灰度底图 + 右侧二值图小窗"""
     img = region['image']
     h, w = img.shape
@@ -270,15 +400,24 @@ def _draw_main_ticks(region: dict,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
     # 下方追加投影图
-    proj_vis = draw_projection_plot(vproj, peaks, width=w,
-                                     title=f"Vertical Projection ({len(main_ticks)} ticks)")
-    ph = proj_vis.shape[0]
+    ref_proj = _main_split_near_projection(binary, band_y1, band_y2)
+    proj_vis = draw_projection_plot(
+        vproj, coarse_peaks, width=w,
+        title=f"Full tick-band projection: coarse candidates ({len(coarse_peaks)} peaks)"
+    )
+    ref_proj_vis = draw_projection_plot(
+        ref_proj, refined_peaks, width=w,
+        title=f"Split-near projection: refined main ticks ({len(main_ticks)} ticks)"
+    )
+    ph = proj_vis.shape[0] + ref_proj_vis.shape[0] + 2
 
     gap = 2
     out = np.zeros((h + ph + gap, w, 3), dtype=np.uint8)
     out[:] = (30, 30, 35)
     out[:h, :w] = vis
-    out[h + gap:h + gap + ph, :w] = proj_vis
+    out[h + gap:h + gap + proj_vis.shape[0], :w] = proj_vis
+    y0 = h + gap + proj_vis.shape[0] + 2
+    out[y0:y0 + ref_proj_vis.shape[0], :w] = ref_proj_vis
 
     cv2.putText(out, "STEP 3: Main Scale Ticks (gray + binary overlay)", (5, out.shape[0] - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 125), 1)
